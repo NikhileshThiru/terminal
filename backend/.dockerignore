@@ -1,0 +1,11 @@
+.venv
+.uv
+.ruff_cache
+.mypy_cache
+.pytest_cache
+__pycache__
+*.pyc
+tests
+.env
+.env.local
+README.md

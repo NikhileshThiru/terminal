@@ -1,0 +1,113 @@
+@import 'tailwindcss';
+
+/*
+ * Terminal design tokens.
+ *
+ * Semantic split that the whole UI follows:
+ *   --color-accent  amber — UI state: active nav, live indicators, selection,
+ *                   focus. The "terminal identity" color.
+ *   --color-up/-down  green/red — market direction ONLY (P&L, price ticks,
+ *                   long/short). Never used for "active" or "ok".
+ *   --color-info    blue — manual-bucket accents + links.
+ *   --color-warning yellow — degraded states, ungrounded figures.
+ */
+
+@theme {
+  --color-bg: #0a0a0c;
+  --color-bg-elevated: #111114;
+  --color-bg-elevated-2: #18181d;
+  --color-border: #1f1f26;
+  --color-border-strong: #2c2c36;
+  --color-text: #e6e6e9;
+  --color-text-muted: #92929e;
+  --color-text-dim: #5c5c66;
+
+  --color-accent: #ffb224;
+  --color-accent-dim: #8a5f10;
+  --color-up: #2bd576;
+  --color-up-dim: #137a42;
+  --color-down: #ff4d6d;
+  --color-down-dim: #8f2438;
+  --color-info: #58a6ff;
+  --color-warning: #ffd166;
+  --color-error: #ff4d6d;
+
+  /* Back-compat aliases used by chart code. */
+  --color-long: #2bd576;
+  --color-short: #ff4d6d;
+
+  --font-mono:
+    'IBM Plex Mono', ui-monospace, SFMono-Regular, 'SF Mono', Consolas, 'Liberation Mono', Menlo,
+    monospace;
+  --font-sans:
+    'IBM Plex Mono', ui-monospace, SFMono-Regular, 'SF Mono', Consolas, 'Liberation Mono', Menlo,
+    monospace;
+
+  --animate-flash-up: flash-up 0.6s ease-out;
+  --animate-flash-down: flash-down 0.6s ease-out;
+  --animate-fade-in: fade-in 0.25s ease-out;
+
+  @keyframes flash-up {
+    0% {
+      background-color: color-mix(in srgb, var(--color-up) 22%, transparent);
+    }
+    100% {
+      background-color: transparent;
+    }
+  }
+  @keyframes flash-down {
+    0% {
+      background-color: color-mix(in srgb, var(--color-down) 22%, transparent);
+    }
+    100% {
+      background-color: transparent;
+    }
+  }
+  @keyframes fade-in {
+    0% {
+      opacity: 0;
+      transform: translateY(2px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+}
+
+/* === Global base (was in styles.css; styles.css is gone) === */
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 30%, transparent);
+}
+
+/* Slim dark scrollbars — a data-dense terminal lives or dies by these. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
