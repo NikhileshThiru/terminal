@@ -40,6 +40,8 @@ frontend/dist/
 
 # Local-only data
 backend/.local/
+# Machine-local Docker overrides (host-port remaps for the dev Mac)
+docker-compose.override.yml
 *.sqlite
 *.sqlite3
 *.db

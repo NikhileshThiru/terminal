@@ -95,12 +95,16 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
-    # Dev frontend runs at :5173; allow it to call the backend.
+    # Dev frontend runs on localhost; allow it to call the backend. We accept
+    # ANY localhost port in development (not just :5173) so the frontend works
+    # regardless of which host port it's published on — e.g. when the Docker
+    # stack remaps 5173→5174 to dodge a conflict with another local project.
+    # Production stays locked down (no origins allowed).
+    is_dev = settings.environment == "development"
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"]
-        if settings.environment == "development"
-        else [],
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?" if is_dev else None,
+        allow_origins=[],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
