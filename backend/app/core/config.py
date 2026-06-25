@@ -152,6 +152,10 @@ class Settings(BaseSettings):
     cache_ttl_filings_list: int = 600
     cache_ttl_quotes: int = 5
 
+    # === Notifications (Step 9.1) ===
+    # Discord webhook for thesis/trade alerts. Absent → feature off.
+    discord_webhook_url: str | None = None
+
     @field_validator("watchlist", mode="before")
     @classmethod
     def _split_watchlist(cls, v: object) -> object:

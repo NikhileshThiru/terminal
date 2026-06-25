@@ -7,7 +7,15 @@ value-per-hour given what's already wired.
 
 ---
 
-## 1. Discord alerts (smallest, highest demo value)
+## 1. Discord alerts (smallest, highest demo value) — **DONE 2026-06-24**
+
+Wired in `app/notify/discord.py` with three embed builders (thesis / trade-open /
+trade-close), `fire_and_forget()` over a 5s-timeout `httpx` POST that swallows
+every exception. Call sites: `eval/persistence.write_thesis`,
+`portfolio/engine._evaluate_one`, `portfolio/resolver.resolve_all`. 22 unit
+tests in `test_notify_discord.py` cover happy path, 4xx, 5xx, connect-error,
+no-webhook, and no-running-loop — all non-raising. Feature off by default
+(absent `DISCORD_WEBHOOK_URL` → no code-path change).
 
 **What:** POST to a Discord webhook when (a) any thesis is persisted and
 (b) a shadow trade is placed. Formatted embed: ticker, direction, confidence,

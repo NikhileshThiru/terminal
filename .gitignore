@@ -50,8 +50,45 @@ backend/terminal.db
 # docs/screenshots/ is committed on purpose — the README renders from it on
 # GitHub. Keep it curated: downscale to ≤1280px, delete superseded captures.
 
-# AI-assistant tooling and working notes — none of it ships to the repo
+# AI-assistant tooling and working notes — none of it ships to the repo.
+# Broad coverage so future AI tools don't leak prompts, history, or context
+# files into the public repo by accident.
+
+# Claude (Code, Desktop, CLI variants)
 .claude/
 CLAUDE.md
+CLAUDE.local.md
+.claude.json
+claude.json
+.anthropic/
+
+# Cursor
+.cursor/
+.cursorrules
+.cursorignore
+.cursor-tutor/
+
+# Other AI IDEs / assistants
+.windsurf/
+.windsurfrules
+.aider*
+.continue/
+.codeium/
+.tabnine/
+.copilot/
+.zed/conversations/
+
+# Recording / history tools that scrape AI chats
+.specstory/
+
+# Cross-tool agent conventions (other AI tools look for these)
+AGENTS.md
+GEMINI.md
+.openai/
+
+# Working notes I keep locally but don't publish
 docs/handoff-*.md
 docs/phase-*.md
+docs/notes-*.md
+docs/scratch/
+*.private.md

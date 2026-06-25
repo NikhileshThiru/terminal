@@ -27,10 +27,10 @@ def _sample_thesis() -> Thesis:
         prediction_window_days=14,
         suggested_contract=SuggestedContract(
             underlying="AAPL",
-            occ_symbol="AAPL260620C00315000",
+            occ_symbol="AAPL270115C00315000",
             option_type="call",
             strike=Decimal("315"),
-            expiration=date(2026, 6, 20),
+            expiration=date(2027, 1, 15),
             estimated_premium_per_contract=Decimal("4.60"),
             contracts=1,
             max_risk_usd=Decimal("460"),
@@ -104,7 +104,7 @@ def test_post_thesis_returns_structured_thesis() -> None:
     assert body["symbol"] == "AAPL"
     assert body["direction"] == "long"
     assert body["confidence"] == 0.65
-    assert body["suggested_contract"]["occ_symbol"] == "AAPL260620C00315000"
+    assert body["suggested_contract"]["occ_symbol"] == "AAPL270115C00315000"
     assert body["grounding_check_passed"] is True
     assert body["llm_provider"] == "gemini"
 

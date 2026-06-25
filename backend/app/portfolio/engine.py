@@ -138,6 +138,7 @@ class PaperEngine:
             contracts=verdict.contracts,
             cost_usd=str(verdict.total_cost_usd),
         )
+        _alert_trade_open(account.kind, trade, verdict.reason)
         return AccountDecision(account_kind=account.kind, decision=verdict, trade=trade)
 
     @staticmethod
@@ -157,6 +158,25 @@ class PaperEngine:
             trades_today=int(trades_today or 0),
             open_positions=int(open_positions or 0),
         )
+
+
+def _alert_trade_open(account_kind: str, trade: ShadowTrade, risk_reason: str) -> None:
+    """Fire-and-forget Discord alert for a freshly opened shadow trade (Step 9.1)."""
+    from app.notify import discord
+
+    if not discord.enabled():
+        return
+    discord.fire_and_forget(
+        discord.build_trade_open_embed(
+            account_kind=account_kind,
+            underlying=trade.underlying,
+            occ_symbol=trade.occ_symbol,
+            option_type=trade.option_type,
+            contracts=int(trade.contracts),
+            total_cost_usd=f"{trade.total_cost_usd:.2f}",
+            risk_reason=risk_reason,
+        )
+    )
 
 
 @lru_cache(maxsize=1)

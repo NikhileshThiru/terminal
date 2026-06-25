@@ -33,6 +33,7 @@ from app.eval.models import RealizedDirection, ThesisOutcome
 from app.eval.models import Thesis as ThesisRow
 from app.portfolio.models import (
     CloseReason,
+    PaperAccount,
     ShadowTrade,
     ShadowTradeStatus,
 )
@@ -137,6 +138,19 @@ class OutcomeResolver:
                 .all()
             )
 
+            # account_id → kind map for alert text (one query per tick, not per trade).
+            account_kinds: dict[int, str] = {}
+            if open_trades:
+                rows = (
+                    await session.execute(
+                        select(PaperAccount.id, PaperAccount.kind).where(
+                            PaperAccount.id.in_({t.account_id for t in open_trades})
+                        )
+                    )
+                ).all()
+                account_kinds = {int(aid): kind for aid, kind in rows}
+
+            closed_trades: list[ShadowTrade] = []
             closed = outcomes = skipped = errors = 0
             for trade in open_trades:
                 try:
@@ -156,6 +170,7 @@ class OutcomeResolver:
                 if did_close:
                     closed += 1
                     outcomes += 1
+                    closed_trades.append(trade)
 
             if closed:
                 await session.commit()
@@ -166,6 +181,10 @@ class OutcomeResolver:
                     skipped=skipped,
                     errors=errors,
                 )
+                for trade in closed_trades:
+                    _alert_trade_close(
+                        account_kinds.get(int(trade.account_id), "unknown"), trade
+                    )
 
             return ResolveResult(
                 closed=closed, outcomes_written=outcomes, skipped=skipped, errors=errors
@@ -299,6 +318,28 @@ class OutcomeResolver:
         if prior:
             return max(prior, key=lambda b: b.timestamp).close
         return None
+
+
+def _alert_trade_close(account_kind: str, trade: ShadowTrade) -> None:
+    """Fire-and-forget Discord alert for a closed shadow trade (Step 9.1).
+
+    Pulls the post-close fields off the (now-committed) row.
+    """
+    from app.notify import discord
+
+    if not discord.enabled():
+        return
+    realized = trade.realized_pnl_usd if trade.realized_pnl_usd is not None else Decimal(0)
+    discord.fire_and_forget(
+        discord.build_trade_close_embed(
+            account_kind=account_kind,
+            underlying=trade.underlying,
+            occ_symbol=trade.occ_symbol,
+            close_reason=trade.close_reason or "unknown",
+            total_cost_usd=f"{trade.total_cost_usd:.2f}",
+            realized_pnl_usd=f"{realized:.2f}",
+        )
+    )
 
 
 @lru_cache(maxsize=1)

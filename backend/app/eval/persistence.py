@@ -84,4 +84,27 @@ async def write_thesis(thesis: ThesisDTO) -> int:
             funnel_latency_ms=row.funnel_latency_ms,
             correlation_id=row.correlation_id,
         )
+        _alert_thesis(row)
         return int(row.id)
+
+
+def _alert_thesis(row: ThesisRow) -> None:
+    """Fire-and-forget Discord alert for a persisted thesis (Step 9.1)."""
+    # Local import keeps the eval module free of an httpx dep at import time.
+    from app.notify import discord
+
+    if not discord.enabled():
+        return
+    contract = row.suggested_contract or {}
+    discord.fire_and_forget(
+        discord.build_thesis_embed(
+            symbol=row.symbol,
+            direction=row.direction,
+            confidence=row.confidence,
+            source_bucket=row.source_bucket,
+            reasoning=row.reasoning,
+            grounding_passed=row.grounding_check_passed,
+            occ_symbol=contract.get("occ_symbol"),
+            max_risk_usd=contract.get("max_risk_usd"),
+        )
+    )
