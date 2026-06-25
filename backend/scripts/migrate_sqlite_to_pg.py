@@ -97,9 +97,13 @@ async def reset_postgres_sequences(target_engine: Any) -> None:
 
 
 async def main() -> None:
+    # Default to the dev SQLite DB next to backend/ (this script lives in
+    # backend/scripts/). Derived from __file__ so it never hardcodes an
+    # absolute project root; override with SOURCE_URL.
+    default_sqlite = Path(__file__).resolve().parent.parent / "terminal.db"
     source_url = os.environ.get(
         "SOURCE_URL",
-        "sqlite+aiosqlite:////Users/nikhilesh/Code/Projects/Terminal/backend/terminal.db",
+        f"sqlite+aiosqlite:///{default_sqlite}",
     )
     target_url = os.environ.get(
         "TARGET_URL",
