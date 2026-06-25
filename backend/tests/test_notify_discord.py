@@ -24,7 +24,10 @@ _WEBHOOK = "https://discord.com/api/webhooks/123/abc"
 
 
 def test_enabled_false_when_webhook_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    # Empty string beats .env (env var has priority in pydantic-settings) and
+    # is falsy, so enabled() reads "no webhook configured" regardless of what's
+    # in the developer's local .env file.
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
     get_settings.cache_clear()
     assert discord.enabled() is False
 
@@ -203,7 +206,8 @@ async def test_send_returns_false_on_connect_error(
 async def test_send_returns_false_when_webhook_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    # Same isolation trick as test_enabled_false_when_webhook_unset.
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
     get_settings.cache_clear()
     ok = await discord.send({"content": "hi"})
     assert ok is False

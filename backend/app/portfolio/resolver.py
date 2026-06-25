@@ -182,9 +182,7 @@ class OutcomeResolver:
                     errors=errors,
                 )
                 for trade in closed_trades:
-                    _alert_trade_close(
-                        account_kinds.get(int(trade.account_id), "unknown"), trade
-                    )
+                    _alert_trade_close(account_kinds.get(int(trade.account_id), "unknown"), trade)
 
             return ResolveResult(
                 closed=closed, outcomes_written=outcomes, skipped=skipped, errors=errors
