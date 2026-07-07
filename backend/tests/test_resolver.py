@@ -350,3 +350,115 @@ def _make_thesis_stub(suggested_contract: dict[str, Any]) -> ThesisRow:
         llm_model="gemini-2.5-flash",
         funnel_latency_ms=5000,
     )
+
+
+# === Two-account theses: one outcome per thesis (thesis_id is UNIQUE) ===
+
+
+async def _seed_second_account_trade(
+    factory: async_sessionmaker,
+    *,
+    thesis_id: int,
+    expiration: date,
+) -> int:
+    """A CONSERVATIVE-account trade on an existing thesis — the two-account
+    shape the paper engine produces for every thesis that passes both gates."""
+    async with factory() as session:
+        account = PaperAccount(
+            kind=AccountKind.CONSERVATIVE.value,
+            name="Conservative",
+            starting_balance_usd=Decimal("100000"),
+            equity_usd=Decimal("100000"),
+            min_confidence=0.7,
+            max_trade_cost_usd=Decimal("250"),
+            max_trades_per_day=3,
+            max_concurrent_positions=5,
+            kill_switch=False,
+            created_at=datetime.now(UTC),
+        )
+        session.add(account)
+        await session.flush()
+        trade = ShadowTrade(
+            account_id=account.id,
+            thesis_id=thesis_id,
+            opened_at=datetime.now(UTC) - timedelta(days=30),
+            underlying="AAPL",
+            occ_symbol="AAPL260821C00350000",
+            option_type="call",
+            strike=Decimal("350"),
+            expiration=expiration,
+            contracts=1,
+            premium_per_contract_usd=Decimal("3.88"),
+            total_cost_usd=Decimal("388"),
+            status=ShadowTradeStatus.SHADOW_OPEN.value,
+            risk_reason="test",
+        )
+        session.add(trade)
+        await session.commit()
+        return int(trade.id)
+
+
+@pytest.mark.asyncio
+async def test_two_trades_same_thesis_close_in_one_tick_write_one_outcome(db_factory) -> None:
+    """Regression: the engine opens one trade per ACCOUNT for a thesis, but
+    thesis_outcomes.thesis_id is UNIQUE. Writing an outcome per trade used to
+    IntegrityError the tick's commit, roll back every close, and re-crash on
+    every subsequent tick (the trades never left shadow_open). Both trades
+    must close; exactly one outcome row is written."""
+    trade_id = await _seed_open_trade(db_factory, expiration=date(2026, 6, 1))
+    async with db_factory() as session:
+        trade = await session.get(ShadowTrade, trade_id)
+        assert trade is not None
+        thesis_id = int(trade.thesis_id)
+    await _seed_second_account_trade(db_factory, thesis_id=thesis_id, expiration=date(2026, 6, 1))
+
+    resolver = OutcomeResolver(
+        options_provider=FakeOptions(),
+        price_provider=FakePrices(last=360.0, ohlc_close=310.0),
+        session_factory=db_factory,
+    )
+    result = await resolver.resolve_all(now=datetime(2026, 6, 2, tzinfo=UTC))
+    assert result.closed == 2
+    assert result.outcomes_written == 1
+    assert result.errors == 0
+
+    async with db_factory() as session:
+        statuses = list((await session.execute(select(ShadowTrade.status))).scalars().all())
+        outcomes = list((await session.execute(select(ThesisOutcome))).scalars().all())
+    assert statuses == [ShadowTradeStatus.SHADOW_CLOSED.value] * 2
+    assert len(outcomes) == 1
+    assert outcomes[0].thesis_id == thesis_id
+
+    # The next tick is a no-op, not a repeat crash.
+    again = await resolver.resolve_all(now=datetime(2026, 6, 2, tzinfo=UTC))
+    assert again.closed == 0
+    assert again.errors == 0
+
+
+@pytest.mark.asyncio
+async def test_sibling_trade_closing_in_later_tick_skips_outcome(db_factory) -> None:
+    """Same shape, but the second account's trade closes a tick later — the
+    committed outcome from tick 1 must suppress a duplicate in tick 2."""
+    trade_id = await _seed_open_trade(db_factory, expiration=date(2026, 6, 1))
+    async with db_factory() as session:
+        trade = await session.get(ShadowTrade, trade_id)
+        assert trade is not None
+        thesis_id = int(trade.thesis_id)
+    # Sibling expires three days later, so it closes on a later tick.
+    await _seed_second_account_trade(db_factory, thesis_id=thesis_id, expiration=date(2026, 6, 4))
+
+    resolver = OutcomeResolver(
+        options_provider=FakeOptions(),
+        price_provider=FakePrices(last=360.0, ohlc_close=310.0),
+        session_factory=db_factory,
+    )
+    tick1 = await resolver.resolve_all(now=datetime(2026, 6, 2, tzinfo=UTC))
+    assert (tick1.closed, tick1.outcomes_written) == (1, 1)
+
+    tick2 = await resolver.resolve_all(now=datetime(2026, 6, 5, tzinfo=UTC))
+    assert (tick2.closed, tick2.outcomes_written) == (1, 0)
+    assert tick2.errors == 0
+
+    async with db_factory() as session:
+        outcomes = list((await session.execute(select(ThesisOutcome))).scalars().all())
+    assert len(outcomes) == 1

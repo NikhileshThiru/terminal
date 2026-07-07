@@ -113,6 +113,32 @@ async def test_provider_failure_skipped_gracefully() -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_first_poll_does_not_complete_bootstrap() -> None:
+    """Regression: a provider outage on the very first tick used to flip
+    _bootstrapped=True with an empty seen-set, so the next successful poll
+    published the entire pre-existing feed as fresh events (one triage +
+    thesis run per stale filing). A failed poll must not count as bootstrap."""
+    bus = InMemoryEventBus()
+    filings = FakeFilings([_filing("acc-1"), _filing("acc-2")])
+    filings.fail_universe = True
+    poller = EdgarPoller(filings=filings, bus=bus)
+    assert await poller.tick() == 0
+    assert not poller._bootstrapped
+
+    # EDGAR recovers: THIS poll is the real bootstrap — publishes nothing.
+    filings.fail_universe = False
+    assert await poller.tick() == 0
+    assert bus.qsize() == 0
+    assert poller._bootstrapped
+
+    # Only filings arriving after the real bootstrap are published.
+    filings.universe.insert(0, _filing("acc-3", sym="MSFT"))
+    assert await poller.tick() == 1
+    ev = await bus.consume()
+    assert ev.id == "acc-3"
+
+
+@pytest.mark.asyncio
 async def test_filings_without_symbol_are_dropped() -> None:
     """The provider should drop them, but defensively the poller also skips empty symbols."""
     bus = InMemoryEventBus()

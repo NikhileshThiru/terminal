@@ -391,12 +391,36 @@ async def test_grounding_failure_after_retries_raises() -> None:
 
 
 @pytest.mark.asyncio
-async def test_text_only_response_uses_structured_fallback() -> None:
+async def test_fallback_with_zero_tools_is_rejected_by_deterministic_gate() -> None:
+    """Regression: the forced fallback used to skip _validate_final_thesis
+    entirely, so a draft with zero data tools, an unfetched contract, and a
+    numberless reasoning (grounding passes trivially) became a real thesis.
+    The fallback must clear the same gate as a normal emit_final_thesis."""
+    draft = _good_final_args()
+    # No significant numbers → grounding alone would wave this through.
+    draft["reasoning"] = "AAPL looks strong here; buying near-dated calls."
     scripted = ScriptedLLM(
         [{"text": "I think AAPL is fine."}],
+        fallback_draft=draft,
+    )
+    cop = _copilot(scripted)
+    with pytest.raises(CopilotError):
+        await cop.generate("AAPL", risk_budget_usd=500)
+
+
+@pytest.mark.asyncio
+async def test_fallback_after_real_tools_passes_the_gate() -> None:
+    """The fallback path still produces a thesis when the model did its
+    research: data tools called, contract from a fetched chain, within budget."""
+    scripted = ScriptedLLM(
+        [
+            {"tool_calls": [("get_quote", {"symbol": "AAPL"})]},
+            {"tool_calls": [("get_options_chain", {"symbol": "AAPL"})]},
+            {"text": "Here is my thesis in prose (no tool call)."},
+        ],
         fallback_draft=_good_final_args(),
     )
     cop = _copilot(scripted)
-    # Tool count is 0 from the fallback path — grounding will fail.
-    with pytest.raises(CopilotError):
-        await cop.generate("AAPL", risk_budget_usd=500)
+    run = await cop.generate("AAPL", risk_budget_usd=500)
+    assert run.thesis.suggested_contract.occ_symbol == _NEAR_OCC
+    assert run.thesis.grounding_check_passed is True

@@ -148,10 +148,10 @@ class MtMService:
 @lru_cache(maxsize=1)
 def get_mtm_service() -> MtMService:
     """App-wide MtMService bound to the live Alpaca provider + eval DB."""
-    from app.data.alpaca import AlpacaProvider
+    from app.data.registry import get_alpaca
     from app.eval.persistence import get_session_factory
 
-    provider = AlpacaProvider()
+    provider = get_alpaca()
     return MtMService(
         options_provider=provider,
         price_provider=provider,

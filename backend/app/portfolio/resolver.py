@@ -154,7 +154,9 @@ class OutcomeResolver:
             closed = outcomes = skipped = errors = 0
             for trade in open_trades:
                 try:
-                    did_close = await self._maybe_resolve_one(session, trade, now, today)
+                    did_close, outcome_written = await self._maybe_resolve_one(
+                        session, trade, now, today
+                    )
                 except ProviderUnavailable as e:
                     skipped += 1
                     _log.warning(
@@ -169,8 +171,9 @@ class OutcomeResolver:
                     continue
                 if did_close:
                     closed += 1
-                    outcomes += 1
                     closed_trades.append(trade)
+                if outcome_written:
+                    outcomes += 1
 
             if closed:
                 await session.commit()
@@ -194,10 +197,11 @@ class OutcomeResolver:
         trade: ShadowTrade,
         now: datetime,
         today: date,
-    ) -> bool:
-        """Decide if `trade` should close; if so, write ThesisOutcome + update row.
+    ) -> tuple[bool, bool]:
+        """Decide if `trade` should close; if so, update the row and (at most
+        once per thesis) write the ThesisOutcome.
 
-        Returns True if the trade was closed in this tick.
+        Returns (closed, outcome_written).
         """
         # Current underlying price (fail-fast on provider issues; the loop will
         # skip + retry next tick).
@@ -207,18 +211,18 @@ class OutcomeResolver:
         # -50% move. No usable price → defer to the next tick.
         underlying_now = underlying_now_q.safe_price()
         if underlying_now is None:
-            return False
+            return False, False
 
         # Load the thesis row first — close-reason logic reads its
         # exit_if_underlying_* + close_n_days_before_expiry fields.
         thesis = await session.get(ThesisRow, trade.thesis_id)
         if thesis is None:
             _log.warning("resolver_thesis_missing", thesis_id=trade.thesis_id)
-            return False
+            return False, False
 
         reason = _choose_close_reason(trade, thesis, today, underlying_now)
         if reason is None:
-            return False
+            return False, False
 
         # Determine the option's close price. For EXPIRED, intrinsic value
         # at expiration. For all other reasons, current mid (or last).
@@ -238,7 +242,7 @@ class OutcomeResolver:
                 underlying=trade.underlying,
                 opened_at=trade.opened_at.isoformat(),
             )
-            return False
+            return False, False
 
         pct_move = float(
             ((underlying_now - underlying_at_open) / underlying_at_open) * Decimal(100)
@@ -253,18 +257,30 @@ class OutcomeResolver:
         trade.close_price_per_contract_usd = close_price
         trade.realized_pnl_usd = realized_pnl
 
-        # Write the outcome.
-        outcome = ThesisOutcome(
-            thesis_id=trade.thesis_id,
-            evaluated_at=now,
-            realized_direction=realized,
-            hit=hit,
-            underlying_price_at_thesis=underlying_at_open,
-            underlying_price_at_eval=underlying_now,
-            pct_move=pct_move,
-            notes=f"shadow_trade_id={trade.id}, close_reason={reason.value}",
+        # Write the outcome — at most ONE per thesis. thesis_outcomes.thesis_id
+        # is UNIQUE, but the engine opens one trade per ACCOUNT for the same
+        # thesis; a second insert would IntegrityError the tick's commit, roll
+        # back every close, and re-crash forever (the trades never leave
+        # shadow_open). The first closing trade grades the thesis; siblings
+        # just close. Autoflush makes this SELECT see a sibling's outcome
+        # added earlier in this same tick.
+        outcome_written = False
+        existing_outcome_id = await session.scalar(
+            select(ThesisOutcome.id).where(ThesisOutcome.thesis_id == trade.thesis_id)
         )
-        session.add(outcome)
+        if existing_outcome_id is None:
+            outcome = ThesisOutcome(
+                thesis_id=trade.thesis_id,
+                evaluated_at=now,
+                realized_direction=realized,
+                hit=hit,
+                underlying_price_at_thesis=underlying_at_open,
+                underlying_price_at_eval=underlying_now,
+                pct_move=pct_move,
+                notes=f"shadow_trade_id={trade.id}, close_reason={reason.value}",
+            )
+            session.add(outcome)
+            outcome_written = True
 
         _log.info(
             "resolver_closed_trade",
@@ -274,8 +290,9 @@ class OutcomeResolver:
             pct_move=pct_move,
             realized=realized,
             hit=hit,
+            outcome_written=outcome_written,
         )
-        return True
+        return True, outcome_written
 
     async def _close_price(
         self,
@@ -343,10 +360,10 @@ def _alert_trade_close(account_kind: str, trade: ShadowTrade) -> None:
 @lru_cache(maxsize=1)
 def get_outcome_resolver() -> OutcomeResolver:
     """App-wide OutcomeResolver bound to Alpaca + eval DB."""
-    from app.data.alpaca import AlpacaProvider
+    from app.data.registry import get_alpaca
     from app.eval.persistence import get_session_factory
 
-    provider = AlpacaProvider()
+    provider = get_alpaca()
     return OutcomeResolver(
         options_provider=provider,
         price_provider=provider,

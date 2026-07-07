@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from functools import lru_cache
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
@@ -17,6 +16,7 @@ from pydantic import BaseModel
 from app.core.logging import get_logger
 from app.data.alpaca import AlpacaProvider
 from app.data.interfaces import OptionsProvider, PriceProvider
+from app.data.registry import get_alpaca
 from app.data.types import ProviderUnavailable
 
 _log = get_logger(__name__)
@@ -24,9 +24,8 @@ _log = get_logger(__name__)
 router = APIRouter(prefix="/chain", tags=["chain"])
 
 
-@lru_cache(maxsize=1)
 def _provider() -> AlpacaProvider:
-    return AlpacaProvider()
+    return get_alpaca()
 
 
 def get_options_provider() -> OptionsProvider:

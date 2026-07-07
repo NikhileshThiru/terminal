@@ -15,9 +15,7 @@ from app.agent.copilot import Copilot
 from app.agent.tools import ToolRegistry
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.data.alpaca import AlpacaProvider
-from app.data.edgar import EdgarFilingsProvider
-from app.data.finnhub import FinnhubProvider
+from app.data.registry import get_alpaca, get_edgar, get_finnhub
 from app.data.types import ProviderUnavailable, ProviderUnavailableReason
 from app.llm.gemini import GeminiProvider
 from app.llm.groq import GroqProvider
@@ -54,9 +52,9 @@ def build_copilot() -> Copilot:
     LLM for the thesis step is config-driven (LLM_THESIS_PROVIDER + LLM_THESIS_MODEL).
     """
     settings = get_settings()
-    alpaca = AlpacaProvider()
-    edgar = EdgarFilingsProvider()
-    finnhub = FinnhubProvider()
+    alpaca = get_alpaca()
+    edgar = get_edgar()
+    finnhub = get_finnhub()
 
     llm = _build_llm(settings.llm_thesis_provider)
     _log.info(

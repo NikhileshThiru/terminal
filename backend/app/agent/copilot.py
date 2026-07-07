@@ -285,8 +285,38 @@ class Copilot:
                     iteration=iterations,
                 )
                 await _emit(event_sink, "fallback_forced", {"iteration": iterations})
-                draft = await self._force_final_thesis(conversation)
-                break
+                forced = await self._force_final_thesis(conversation)
+                # The forced draft goes through the SAME deterministic gate as
+                # a normal emit_final_thesis call (min data tools, contract
+                # must exist in a fetched chain, max_risk within budget) —
+                # otherwise this path is a side door around every guardrail.
+                response = self._validate_final_thesis(
+                    forced.model_dump(mode="json"),
+                    data_tool_call_count=data_tool_call_count,
+                    chain_fetches=chain_fetches,
+                    risk_budget_usd=risk_budget_usd,
+                )
+                if response.ok:
+                    draft = response.draft
+                    break
+                _log.warning(
+                    "copilot_fallback_rejected",
+                    correlation_id=correlation_id,
+                    iteration=iterations,
+                    error=response.error,
+                )
+                await _emit(event_sink, "thesis_rejected", {"error": response.error})
+                conversation.append(
+                    AgentMessage(
+                        role="user",
+                        content=(
+                            f"Your thesis was rejected by validation: {response.error} "
+                            "Use the data tools (start with get_quote and "
+                            "get_options_chain), then call emit_final_thesis."
+                        ),
+                    )
+                )
+                continue
 
             committed_draft: ThesisDraft | None = None
             for tc in turn.tool_calls:

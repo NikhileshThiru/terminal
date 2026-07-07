@@ -23,6 +23,7 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.data.edgar import EdgarFilingsProvider
 from app.data.finnhub import FinnhubProvider
+from app.data.registry import get_edgar, get_finnhub
 from app.data.types import ProviderUnavailable, ProviderUnavailableReason
 from app.discovery.alpaca_news_stream import AlpacaNewsStream
 from app.discovery.bus import EventBus, InMemoryEventBus
@@ -144,7 +145,7 @@ class AutonomousWorker:
         self._state = WorkerState.STARTING
         try:
             self._bus = InMemoryEventBus(maxsize=1000)
-            self._edgar = EdgarFilingsProvider()
+            self._edgar = get_edgar()
             self._triage_llm = _build_triage_llm(settings.llm_triage_provider)
             copilot = build_copilot()
             from app.eval.persistence import get_session_factory
@@ -204,7 +205,7 @@ class AutonomousWorker:
             # theses on them. Skipped silently if Finnhub auth isn't set so the
             # rest of the pipeline still works.
             try:
-                self._finnhub = FinnhubProvider()
+                self._finnhub = get_finnhub()
                 self._catalyst = CatalystJobs(
                     fetcher=CalendarFetcher(
                         finnhub=self._finnhub,

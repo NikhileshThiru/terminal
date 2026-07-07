@@ -13,7 +13,6 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from decimal import Decimal
-from functools import lru_cache
 
 from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
@@ -22,6 +21,7 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.data.alpaca import AlpacaProvider
 from app.data.interfaces import PriceProvider
+from app.data.registry import get_alpaca
 from app.data.types import ProviderUnavailable
 
 _log = get_logger(__name__)
@@ -29,9 +29,8 @@ _log = get_logger(__name__)
 router = APIRouter(prefix="/prices", tags=["prices"])
 
 
-@lru_cache(maxsize=1)
 def _provider() -> AlpacaProvider:
-    return AlpacaProvider()
+    return get_alpaca()
 
 
 def get_price_provider() -> PriceProvider:

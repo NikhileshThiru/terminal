@@ -185,6 +185,7 @@ class EdgarPoller:
         if self._session_factory is not None:
             session = self._session_factory()
             await session.__aenter__()
+        fetch_failed = False
         try:
             try:
                 filings = await self._filings.get_latest_universe_filings(
@@ -193,6 +194,7 @@ class EdgarPoller:
             except ProviderUnavailable as e:
                 _log.warning("edgar_poller_provider_unavailable", reason=e.reason.value)
                 filings = []
+                fetch_failed = True
 
             for f in filings:
                 if f.accession in self._seen:
@@ -228,7 +230,11 @@ class EdgarPoller:
         finally:
             if session is not None:
                 await session.__aexit__(None, None, None)
-        if not self._bootstrapped:
+        # Bootstrap completes only after a poll that actually reached EDGAR.
+        # A failed first poll leaves _seen empty; flipping the flag anyway
+        # would make the next successful poll publish the whole ~40-item
+        # atom feed as "fresh" — one triage + thesis run per stale filing.
+        if not self._bootstrapped and not fetch_failed:
             self._bootstrapped = True
             _log.info(
                 "edgar_poller_bootstrapped",
