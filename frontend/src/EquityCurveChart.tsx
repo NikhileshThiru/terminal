@@ -249,14 +249,28 @@ function computeAccountStats(c: EquityCurveResponse | null): AccountStats | null
   const current = equities[equities.length - 1];
   const pnl = current - starting;
   const pnlPct = starting > 0 ? (pnl / starting) * 100 : 0;
-  // Max drawdown: largest (current - running_max) seen.
+  const { maxDrawdown, maxDrawdownPct } = maxDrawdownOf(equities);
+  return { current, pnl, pnlPct, maxDrawdown, maxDrawdownPct };
+}
+
+/**
+ * Largest peak-to-trough decline, in dollars and as a % of the peak it fell
+ * FROM (the contemporaneous running max). Dividing by the final global peak
+ * understates the drawdown whenever equity later sets a new high.
+ */
+export function maxDrawdownOf(equities: number[]): {
+  maxDrawdown: number;
+  maxDrawdownPct: number;
+} {
   let runningMax = -Infinity;
   let maxDrawdown = 0;
+  let maxDrawdownPct = 0;
   for (const v of equities) {
     if (v > runningMax) runningMax = v;
     const dd = v - runningMax;
     if (dd < maxDrawdown) maxDrawdown = dd;
+    const ddPct = runningMax > 0 ? (dd / runningMax) * 100 : 0;
+    if (ddPct < maxDrawdownPct) maxDrawdownPct = ddPct;
   }
-  const maxDrawdownPct = runningMax > 0 ? (maxDrawdown / runningMax) * 100 : 0;
-  return { current, pnl, pnlPct, maxDrawdown, maxDrawdownPct };
+  return { maxDrawdown, maxDrawdownPct };
 }

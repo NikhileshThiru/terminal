@@ -32,3 +32,9 @@ repos:
     rev: v8.21.2
     hooks:
       - id: gitleaks
+
+  # Secrets: block commits containing API keys / webhooks (CI runs it too).
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks

@@ -6,12 +6,16 @@ free tiers — the chip in the header is about *instrumentation*, not
 billing. Pricing constants are kept in this file so swapping providers
 or tuning model selection has one place to update.
 
-Resets on process restart; for durable accounting we'd write to a
-`llm_usage_log` table, but that's overkill for the demo's purpose.
+Resets on process restart. Durable per-call accounting (survives restarts,
+feeds the daily-budget chip) lives in the `llm_calls` table written by the
+LLM router — see app/llm/usage_log.py. This tracker stays as the cheap
+in-process view and as the hand-off point for per-call token counts
+(`last_usage()`), which the router reads after each call.
 """
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from threading import Lock
@@ -26,11 +30,28 @@ PRICING_USD_PER_1M: dict[str, tuple[float, float]] = {
     "gemini-2.5-flash-lite": (0.10, 0.40),
     "gemini-2.0-flash": (0.075, 0.30),
     "gemini-1.5-flash": (0.075, 0.30),
-    # Groq
-    "llama-3.3-70b-versatile": (0.59, 0.79),
-    "mixtral-8x7b-32768": (0.27, 0.27),
+    # Groq (paid-tier list prices; the free tier zeroes these in practice)
+    "openai/gpt-oss-20b": (0.075, 0.30),
+    "openai/gpt-oss-120b": (0.15, 0.60),
+    "llama-3.3-70b-versatile": (0.59, 0.79),  # retired upstream; kept for old rows
     # Defaults for unknown models — explicit zero, not a guess.
 }
+
+
+# Token counts of the most recent successful call in this asyncio context.
+# Providers set it inside `record()`; the router (which awaits the provider
+# in the same context) reads it back — the only way to get token counts out
+# of `complete_structured`, whose return type is the caller's schema.
+_last_usage: ContextVar[tuple[int, int] | None] = ContextVar("llm_last_usage", default=None)
+
+
+def last_usage() -> tuple[int, int] | None:
+    """(input_tokens, output_tokens) of the last recorded call, if any."""
+    return _last_usage.get()
+
+
+def reset_last_usage() -> None:
+    _last_usage.set(None)
 
 
 def _price_for(model: str) -> tuple[float, float]:
@@ -81,6 +102,7 @@ class CostTracker:
         self._stats: dict[tuple[str, str], _ModelStat] = {}
 
     def record(self, *, provider: str, model: str, input_tokens: int, output_tokens: int) -> None:
+        _last_usage.set((input_tokens, output_tokens))
         if input_tokens <= 0 and output_tokens <= 0:
             return
         key = (provider, model)

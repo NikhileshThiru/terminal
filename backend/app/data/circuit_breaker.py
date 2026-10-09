@@ -4,7 +4,9 @@ States:
 - CLOSED: calls pass through; failures increment a counter.
 - OPEN: calls raise CircuitOpen immediately. After `recovery_timeout`
   seconds, transitions to HALF_OPEN.
-- HALF_OPEN: one trial call is allowed. Success → CLOSED. Failure → OPEN.
+- HALF_OPEN: exactly one trial call (the probe) is allowed; concurrent
+  callers keep getting CircuitOpen until it finishes. Success → CLOSED.
+  Failure → OPEN. A cancelled probe releases the slot for the next caller.
 
 Protects upstream quotas during outages and keeps the agent funnel from
 piling up failed retries.
@@ -55,6 +57,7 @@ class CircuitBreaker:
         self._state = CircuitState.CLOSED
         self._failures = 0
         self._opened_at: float | None = None
+        self._probe_in_flight = False
         self._clock = clock
         self._lock = asyncio.Lock()
 
@@ -68,17 +71,26 @@ class CircuitBreaker:
 
     async def call(self, fn: Callable[[], Awaitable[T]]) -> T:
         """Run fn() under the breaker. Raises CircuitOpen if open."""
-        await self._check_state()
+        is_probe = await self._check_state()
         try:
             result = await fn()
         except Exception:
             await self._on_failure()
             raise
+        except BaseException:
+            # Cancellation is not evidence about upstream health; just free
+            # the probe slot so the breaker can't wedge in HALF_OPEN.
+            if is_probe:
+                async with self._lock:
+                    self._probe_in_flight = False
+            raise
         else:
             await self._on_success()
             return result
 
-    async def _check_state(self) -> None:
+    async def _check_state(self) -> bool:
+        """Raise CircuitOpen if the call must not proceed. Returns True when
+        this caller is the HALF_OPEN probe."""
         async with self._lock:
             if self._state == CircuitState.OPEN:
                 assert self._opened_at is not None
@@ -86,14 +98,26 @@ class CircuitBreaker:
                 remaining = self._recovery_timeout - elapsed
                 if remaining > 0:
                     raise CircuitOpen(self.name, remaining)
-                # Recovery time elapsed — allow one trial call.
+                # Recovery time elapsed — this caller becomes the probe.
                 self._state = CircuitState.HALF_OPEN
+                self._probe_in_flight = True
+                return True
+            if self._state == CircuitState.HALF_OPEN:
+                if self._probe_in_flight:
+                    # Another caller is already testing the upstream. Without
+                    # this, every concurrent caller piles onto a source that
+                    # was failing seconds ago.
+                    raise CircuitOpen(self.name, 0.0)
+                self._probe_in_flight = True
+                return True
+            return False
 
     async def _on_success(self) -> None:
         async with self._lock:
             self._state = CircuitState.CLOSED
             self._failures = 0
             self._opened_at = None
+            self._probe_in_flight = False
 
     async def _on_failure(self) -> None:
         async with self._lock:
@@ -103,3 +127,4 @@ class CircuitBreaker:
             if half_open_failure or tripped_by_threshold:
                 self._state = CircuitState.OPEN
                 self._opened_at = self._clock()
+            self._probe_in_flight = False

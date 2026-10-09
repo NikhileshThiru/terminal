@@ -167,6 +167,35 @@ async def test_shadow_trades_filter_by_account_kind() -> None:
 
 
 @pytest.mark.asyncio
+async def test_old_open_position_not_hidden_by_newer_closed_trades() -> None:
+    """Regression: the page fetched the 30 newest trades of any status and
+    filtered client-side, so a long-held open position vanished from Open
+    Positions once 30 newer trades had closed. The status filter is applied
+    before the limit."""
+    _, a_id = await _seed_accounts()
+    th_id = await _seed_thesis()
+    old_open = await _seed_shadow_trade(a_id, th_id)
+    factory = persistence.get_session_factory()
+    async with factory() as session:
+        trade = await session.get(ShadowTrade, old_open)
+        assert trade is not None
+        trade.opened_at = datetime.now(UTC) - timedelta(days=20)
+        await session.commit()
+    for _ in range(3):
+        await _seed_shadow_trade(a_id, th_id, status="shadow_closed")
+
+    c = _client()
+    unfiltered = c.get("/portfolio/shadow-trades?limit=3").json()
+    assert all(t["status"] == "shadow_closed" for t in unfiltered)  # the old bug's view
+
+    opened = c.get("/portfolio/shadow-trades?status=open&limit=3").json()
+    assert [t["id"] for t in opened] == [old_open]
+    closed = c.get("/portfolio/shadow-trades?status=closed&limit=10").json()
+    assert len(closed) == 3 and all(t["status"] == "shadow_closed" for t in closed)
+    assert c.get("/portfolio/shadow-trades?status=bogus").status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_accounts_endpoint_no_trades_yet() -> None:
     await _seed_accounts()
     r = _client().get("/portfolio/accounts")
@@ -174,3 +203,32 @@ async def test_accounts_endpoint_no_trades_yet() -> None:
     for acc in body:
         assert acc["shadow_trades_total"] == 0
         assert acc["open_shadow_positions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_equity_curve_baseline_includes_pre_window_realized() -> None:
+    """Regression: P&L realized before the query window used to vanish — the
+    curve started flat at starting_balance while /portfolio/accounts reported
+    the true equity, so the flagship A/B chart contradicted the account card."""
+    _, a_id = await _seed_accounts()
+    th_id = await _seed_thesis()
+    await _seed_shadow_trade(
+        a_id,
+        th_id,
+        status="shadow_closed",
+        closed_at=datetime.now(UTC) - timedelta(days=40),
+        realized_pnl_usd=Decimal("3000"),
+        close_reason="expired",
+    )
+
+    client = _client()
+    r = client.get("/portfolio/accounts/aggressive/equity-curve?days=30")
+    assert r.status_code == 200
+    first = r.json()["points"][0]
+    assert float(first["equity"]) == pytest.approx(103_000.0)
+    assert float(first["closed_realized"]) == pytest.approx(3_000.0)
+
+    # The two endpoints must agree on equity for the same account.
+    accounts = client.get("/portfolio/accounts").json()
+    agg = next(acc for acc in accounts if acc["kind"] == "aggressive")
+    assert float(agg["equity_usd"]) == pytest.approx(103_000.0)

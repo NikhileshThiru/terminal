@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from app.agent.copilot import Copilot, CopilotError
+from app.agent.copilot import AttemptRecord, Copilot, CopilotError, GroundingRejected
 from app.agent.tools import ToolRegistry
 from app.data.types import (
     AnalystRating,
@@ -62,6 +62,7 @@ class ScriptedLLM:
         self.turns = list(turns)
         self.call_count = 0
         self._fallback_draft = fallback_draft
+        self.seen_conversations: list[list[AgentMessage]] = []
 
     async def step_agent(
         self,
@@ -75,6 +76,7 @@ class ScriptedLLM:
             raise RuntimeError("ScriptedLLM ran out of turns")
         spec = self.turns.pop(0)
         self.call_count += 1
+        self.seen_conversations.append(list(conversation))
         tool_calls = [
             AgentToolCall(id=f"call_{uuid.uuid4().hex[:8]}", name=name, arguments=args)
             for (name, args) in spec.get("tool_calls", [])
@@ -226,6 +228,28 @@ async def test_happy_path_two_tools_then_final() -> None:
     assert run.thesis.suggested_contract.occ_symbol == _NEAR_OCC
     assert run.thesis.grounding_check_passed is True
     assert run.thesis.llm_provider == "scripted"
+
+
+@pytest.mark.asyncio
+async def test_direction_contradicting_option_type_is_rejected_then_fixed() -> None:
+    """A 'long' thesis that buys a put (seen in July's data: NFLX, ALNY, CC)
+    bets against its own stated direction — and the eval grades the direction
+    field. The gate rejects it with feedback; the model corrects on retry."""
+    contradictory = _good_final_args()
+    contradictory["direction"] = "short"  # but the contract is still a call
+    scripted = ScriptedLLM(
+        [
+            {"tool_calls": [("get_quote", {"symbol": "AAPL"})]},
+            {"tool_calls": [("get_options_chain", {"symbol": "AAPL"})]},
+            {"tool_calls": [("emit_final_thesis", contradictory)]},
+            {"tool_calls": [("emit_final_thesis", _good_final_args())]},
+        ]
+    )
+    run = await _copilot(scripted).generate("AAPL", risk_budget_usd=500)
+    assert run.thesis.direction == "long"
+    assert run.thesis.suggested_contract.option_type == "call"
+    feedback = [m for m in scripted.seen_conversations[-1] if m.role == "tool"]
+    assert any("contradicts the suggested call" in str(m.tool_result) for m in feedback)
 
 
 # === Strictness: must call data tools before emit_final_thesis ===
@@ -382,9 +406,17 @@ async def test_grounding_failure_after_retries_raises() -> None:
         ]
     )
     cop = _copilot(scripted)
-    with pytest.raises(CopilotError) as exc:
-        await cop.generate("AAPL", risk_budget_usd=500)
+    attempts: list[AttemptRecord] = []
+
+    async def sink(record: AttemptRecord) -> None:
+        attempts.append(record)
+
+    cop.attempt_sink = sink
+    with pytest.raises(GroundingRejected) as exc:
+        await cop.generate("AAPL", risk_budget_usd=500, source_bucket="reactive")
     assert "grounding" in str(exc.value).lower()
+    # The rejection is recorded — it's the denominator of the graduation gate.
+    assert [(a.outcome, a.source_bucket) for a in attempts] == [("grounding_rejected", "reactive")]
 
 
 # === No-tool-call fallback ===
@@ -424,3 +456,76 @@ async def test_fallback_after_real_tools_passes_the_gate() -> None:
     run = await cop.generate("AAPL", risk_budget_usd=500)
     assert run.thesis.suggested_contract.occ_symbol == _NEAR_OCC
     assert run.thesis.grounding_check_passed is True
+
+
+# === Strike + premium must match the fetched chain ===
+
+
+@pytest.mark.asyncio
+async def test_emit_final_with_inflated_premium_is_rejected_then_corrected() -> None:
+    """The occ symbol alone is not enough: a real contract with an invented
+    premium corrupts the fill price, max_risk, and eval P&L. The premium must
+    sit inside the fetched bid/ask (±10%)."""
+    bad = _good_final_args()
+    bad["suggested_contract"] = {
+        **bad["suggested_contract"],
+        # Real occ, invented premium: chain quotes 4.50/4.70.
+        "estimated_premium_per_contract": "2.00",
+        "max_risk_usd": "200",  # arithmetic-consistent and within budget
+    }
+    scripted = ScriptedLLM(
+        [
+            {"tool_calls": [("get_quote", {"symbol": "AAPL"})]},
+            {"tool_calls": [("get_options_chain", {"symbol": "AAPL"})]},
+            {"tool_calls": [("emit_final_thesis", bad)]},
+            {"tool_calls": [("emit_final_thesis", _good_final_args())]},
+        ]
+    )
+    cop = _copilot(scripted)
+    run = await cop.generate("AAPL", risk_budget_usd=500)
+    assert run.thesis.suggested_contract.estimated_premium_per_contract == Decimal("4.60")
+
+
+@pytest.mark.asyncio
+async def test_emit_final_with_wrong_strike_is_rejected_then_corrected() -> None:
+    bad = _good_final_args()
+    bad["suggested_contract"] = {
+        **bad["suggested_contract"],
+        "strike": "310",  # chain says 315 for this occ symbol
+    }
+    scripted = ScriptedLLM(
+        [
+            {"tool_calls": [("get_quote", {"symbol": "AAPL"})]},
+            {"tool_calls": [("get_options_chain", {"symbol": "AAPL"})]},
+            {"tool_calls": [("emit_final_thesis", bad)]},
+            {"tool_calls": [("emit_final_thesis", _good_final_args())]},
+        ]
+    )
+    cop = _copilot(scripted)
+    run = await cop.generate("AAPL", risk_budget_usd=500)
+    assert run.thesis.suggested_contract.strike == Decimal("315")
+
+
+@pytest.mark.asyncio
+async def test_events_carry_run_id_and_sequence_for_client_dedupe() -> None:
+    """The Ask-the-Agent page receives each manual run twice (its own stream
+    + the global broadcaster); run_id + seq let it render each step once."""
+    from app.agent.copilot import CopilotEvent
+
+    seen: list[CopilotEvent] = []
+
+    async def sink(evt: CopilotEvent) -> None:
+        seen.append(evt)
+
+    scripted = ScriptedLLM(
+        [
+            {"tool_calls": [("get_quote", {"symbol": "AAPL"})]},
+            {"tool_calls": [("get_options_chain", {"symbol": "AAPL"})]},
+            {"tool_calls": [("emit_final_thesis", _good_final_args())]},
+        ]
+    )
+    await _copilot(scripted).generate("AAPL", risk_budget_usd=500, event_sink=sink)
+    run_ids = {e.payload["run_id"] for e in seen}
+    seqs = [e.payload["seq"] for e in seen]
+    assert len(run_ids) == 1
+    assert seqs == list(range(1, len(seen) + 1))  # unique, ordered, per run

@@ -30,6 +30,7 @@ from app.data.interfaces import FilingsProvider, OptionsProvider, PriceProvider
 from app.data.types import (
     Filing,
     FilingType,
+    OptionContract,
     ProviderUnavailable,
 )
 from app.llm.interface import AgentToolDef
@@ -374,7 +375,7 @@ class ToolRegistry:
         return {
             "symbol": inp.symbol.upper(),
             "expiration": expiration.isoformat(),
-            "contracts": [c.model_dump(mode="json") for c in chain],
+            "contracts": [_contract_with_mid(c) for c in chain],
         }
 
     async def _h_get_recent_filings(self, inp: BaseModel) -> dict[str, Any]:
@@ -415,6 +416,17 @@ class ToolRegistry:
             "upcoming": [e.model_dump(mode="json") for e in calendar],
             "recent_surprises": [s.model_dump(mode="json") for s in surprises],
         }
+
+
+def _contract_with_mid(c: OptionContract) -> dict[str, Any]:
+    """Chain contract plus an explicit bid/ask mid. The model prices its
+    suggested premium off the mid; providing it as real tool data keeps the
+    grounding check's precision-aware matching honest (a cited mid would
+    otherwise trace to no tool value and be rejected)."""
+    d = c.model_dump(mode="json")
+    if c.bid is not None and c.ask is not None and c.bid > 0 < c.ask:
+        d["mid"] = str((c.bid + c.ask) / 2)
+    return d
 
 
 def _filing_to_dict(f: Filing) -> dict[str, Any]:

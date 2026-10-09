@@ -21,7 +21,7 @@ Trigger logic:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -29,8 +29,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agent.copilot import Copilot, CopilotError
 from app.core.correlation import set_correlation_id
 from app.core.logging import get_logger
+from app.core.market_hours import eastern_today, is_market_open
 from app.discovery.models import CatalystEvent, CatalystEventState
-from app.eval.persistence import write_thesis
+from app.eval.models import Thesis as ThesisRow
+from app.eval.persistence import alert_thesis
 
 _log = get_logger(__name__)
 
@@ -47,7 +49,7 @@ class ScheduleResult:
 
 def _build_catalyst_prompt(event: CatalystEvent) -> str:
     """Convert a catalyst row into a user-thesis-style prompt for the copilot."""
-    days_out = (event.event_date - datetime.now(UTC).date()).days
+    days_out = (event.event_date - eastern_today()).days
     when = "today" if days_out == 0 else f"in {days_out} day{'s' if days_out != 1 else ''}"
 
     pieces = [
@@ -69,6 +71,19 @@ def _build_catalyst_prompt(event: CatalystEvent) -> str:
     return "\n".join(pieces)
 
 
+def add_trading_days(start: date, n: int) -> date:
+    """`start` + n weekdays. The lead window counts sessions, not calendar
+    days: with a 2-day lead, a Monday report must fire on Friday — counting
+    calendar days left Monday out of Friday's window, and the market-hours
+    gate then fired it Monday morning, after a pre-market report."""
+    day, remaining = start, n
+    while remaining > 0:
+        day += timedelta(days=1)
+        if day.weekday() < 5:
+            remaining -= 1
+    return day
+
+
 class CatalystScheduler:
     """Triggers catalyst theses for events within the lead window."""
 
@@ -79,11 +94,15 @@ class CatalystScheduler:
         session_factory: async_sessionmaker[AsyncSession],
         lead_days: int = 2,
         risk_budget_usd: float = 500.0,
+        enforce_market_hours: bool = False,
     ) -> None:
         self._copilot = copilot
         self._session_factory = session_factory
         self._lead_days = lead_days
         self._risk_budget = risk_budget_usd
+        # Prod wiring (worker.py) passes settings.market_hours_gate; the
+        # default stays off so tests aren't wall-clock-dependent.
+        self._enforce_market_hours = enforce_market_hours
 
         # Counters surfaced via worker.status().
         self.runs_completed = 0
@@ -94,8 +113,15 @@ class CatalystScheduler:
 
     async def run_once(self) -> ScheduleResult:
         """One tick: find candidates inside the lead window and trigger each."""
-        today = datetime.now(UTC).date()
-        deadline = today + timedelta(days=self._lead_days)
+        # Market-hours gate (CLAUDE.md §7): unlike reactive events, catalysts
+        # lose nothing by waiting — rows stay SCHEDULED and the next
+        # open-hours tick fires them against live quotes.
+        if self._enforce_market_hours and not is_market_open(datetime.now(UTC)):
+            _log.debug("catalyst_scheduler_off_session_skip")
+            return ScheduleResult(triggered=0, skipped=0, failures=0, candidates=0)
+
+        today = eastern_today()
+        deadline = add_trading_days(today, self._lead_days)
 
         triggered = skipped = failures = 0
         async with self._session_factory() as session:
@@ -113,6 +139,14 @@ class CatalystScheduler:
                 .scalars()
                 .all()
             )
+            # Pre-positioning only. An event reporting today before the open
+            # (or at an unknown hour) is already public by the first
+            # open-hours tick, and a thesis written after the numbers are out
+            # isn't a catalyst bet — it would read the results it's supposed
+            # to predict. Only after-close reports may still fire on the day.
+            candidates = [
+                e for e in candidates if e.event_date > today or (e.event_hour or "") == "amc"
+            ]
 
             for event in candidates:
                 try:
@@ -130,9 +164,6 @@ class CatalystScheduler:
                     triggered += 1
                 else:
                     skipped += 1
-
-            if triggered:
-                await session.commit()
 
         self.runs_completed += 1
         self.theses_triggered += triggered
@@ -178,10 +209,19 @@ class CatalystScheduler:
             )
             return False
 
-        thesis_id = await write_thesis(run.thesis)
+        # The thesis row and the event's TRIGGERED transition commit in ONE
+        # transaction. They used to commit separately (thesis immediately,
+        # event at end of tick), so a crash/restart in between re-selected the
+        # still-SCHEDULED event and fired a duplicate thesis.
+        row = ThesisRow(**run.thesis.to_orm_kwargs())
+        session.add(row)
+        await session.flush()  # assigns row.id
+        thesis_id = int(row.id)
         event.state = CatalystEventState.TRIGGERED.value
         event.thesis_id = thesis_id
         event.triggered_at = datetime.now(UTC)
+        await session.commit()
+        alert_thesis(row)
 
         # Hook the paper engine (mirrors what the reactive runner does so
         # catalyst theses contribute to the shadow portfolio too).

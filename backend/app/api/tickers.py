@@ -85,6 +85,7 @@ class _CachedProfile(BaseModel):
 
 _PROFILE_CACHE: dict[str, _CachedProfile] = {}
 _PROFILE_TTL_SECONDS = 3600
+_PROFILE_FETCH_TIMEOUT_SECONDS = 10.0
 
 
 @lru_cache(maxsize=1)
@@ -119,7 +120,17 @@ async def _fetch_profile(symbol: str) -> dict[str, Any]:
                 return {}
 
     loop = asyncio.get_running_loop()
-    payload = await loop.run_in_executor(_yf_sync_executor(), _blocking_fetch)
+    try:
+        # yfinance is unofficial and its failure mode is often a *hang*, not
+        # an exception. Bound the wait so the request degrades to an empty
+        # profile instead of never responding; don't cache the miss.
+        payload = await asyncio.wait_for(
+            loop.run_in_executor(_yf_sync_executor(), _blocking_fetch),
+            timeout=_PROFILE_FETCH_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        _log.warning("yfinance_info_timeout", symbol=symbol)
+        return {}
     _PROFILE_CACHE[symbol] = _CachedProfile(payload=payload, fetched_at=datetime.now(UTC))
     return payload
 

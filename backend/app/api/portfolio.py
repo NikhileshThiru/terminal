@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 
+from app.core.market_hours import eastern_day_start
 from app.eval.persistence import get_session_factory
-from app.portfolio.models import PaperAccount, PositionMark, ShadowTrade
+from app.portfolio.models import PaperAccount, PositionMark, ShadowTrade, ShadowTradeStatus
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
@@ -67,7 +69,8 @@ async def list_accounts() -> list[AccountSummary]:
             .scalars()
             .all()
         )
-        today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        # Same ET trading-day boundary the engine's daily cap uses.
+        today_start = eastern_day_start(datetime.now(UTC))
         out: list[AccountSummary] = []
         for a in accounts:
             open_count = (
@@ -162,8 +165,13 @@ async def list_accounts() -> list[AccountSummary]:
 @router.get("/shadow-trades", response_model=list[ShadowTradeOut])
 async def list_shadow_trades(
     account_kind: str | None = Query(default=None),
+    status: Literal["open", "closed"] | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=200),
 ) -> list[ShadowTradeOut]:
+    """Recent shadow trades, newest first. Filter by `status` server-side:
+    the limit applies AFTER the filter, so an open position can't be pushed
+    out of the window by newer closed trades (it used to vanish from the
+    Open Positions table once >30 trades existed)."""
     factory = get_session_factory()
     async with factory() as session:
         stmt = (
@@ -174,6 +182,10 @@ async def list_shadow_trades(
         )
         if account_kind:
             stmt = stmt.where(PaperAccount.kind == account_kind)
+        if status == "open":
+            stmt = stmt.where(ShadowTrade.status == ShadowTradeStatus.SHADOW_OPEN.value)
+        elif status == "closed":
+            stmt = stmt.where(ShadowTrade.status != ShadowTradeStatus.SHADOW_OPEN.value)
         rows = (await session.execute(stmt)).all()
 
         # Latest mark per listed trade, in one query.
@@ -302,6 +314,53 @@ async def equity_curve(
             )
         ).all()
 
+        # Baseline at the window start. Without it the first point sits at
+        # starting_balance and the whole series is offset by everything that
+        # happened before `since` — contradicting /portfolio/accounts, which
+        # derives equity from ALL history.
+        baseline_realized = (
+            await session.scalar(
+                select(func.coalesce(func.sum(ShadowTrade.realized_pnl_usd), 0)).where(
+                    ShadowTrade.account_id == account.id,
+                    ShadowTrade.status == "shadow_closed",
+                    ShadowTrade.closed_at.is_not(None),
+                    ShadowTrade.closed_at < since,
+                )
+            )
+            or 0
+        )
+        # Latest pre-window mark per trade still open as of `since` — seeds
+        # the running open-P&L map the in-window events then update.
+        latest_pre_mark = (
+            select(
+                PositionMark.shadow_trade_id,
+                func.max(PositionMark.marked_at).label("max_at"),
+            )
+            .join(ShadowTrade, PositionMark.shadow_trade_id == ShadowTrade.id)
+            .where(
+                ShadowTrade.account_id == account.id,
+                PositionMark.marked_at < since,
+                or_(
+                    ShadowTrade.closed_at.is_(None),
+                    ShadowTrade.closed_at >= since,
+                ),
+            )
+            .group_by(PositionMark.shadow_trade_id)
+            .subquery()
+        )
+        pre_marks = (
+            await session.execute(
+                select(
+                    PositionMark.shadow_trade_id,
+                    PositionMark.unrealized_pnl_usd,
+                ).join(
+                    latest_pre_mark,
+                    (PositionMark.shadow_trade_id == latest_pre_mark.c.shadow_trade_id)
+                    & (PositionMark.marked_at == latest_pre_mark.c.max_at),
+                )
+            )
+        ).all()
+
     # Merge marks + closes into one chronological event stream.
     events: list[tuple[datetime, str, int, Decimal]] = []
     for marked_at, unreal, trade_id in marks_rows:
@@ -314,14 +373,17 @@ async def equity_curve(
         events.append((closed_at, "close", trade_id, realized or Decimal(0)))
     events.sort(key=lambda e: e[0])
 
-    open_pnl_per_trade: dict[int, Decimal] = {}
-    realized_total = Decimal(0)
+    open_pnl_per_trade: dict[int, Decimal] = {
+        int(trade_id): (unreal or Decimal(0)) for trade_id, unreal in pre_marks
+    }
+    realized_total = Decimal(str(baseline_realized))
+    baseline_open = sum(open_pnl_per_trade.values(), start=Decimal(0))
     points: list[EquityPoint] = [
         EquityPoint(
             t=since,
-            equity=account.starting_balance_usd,
-            open_unrealized=Decimal(0),
-            closed_realized=Decimal(0),
+            equity=account.starting_balance_usd + realized_total + baseline_open,
+            open_unrealized=baseline_open,
+            closed_realized=realized_total,
         )
     ]
     for ts, kind, trade_id, value in events:

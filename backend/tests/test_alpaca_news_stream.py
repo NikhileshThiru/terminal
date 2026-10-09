@@ -64,6 +64,21 @@ def test_news_to_event_canonicalizes_symbols() -> None:
     assert ev.kind == "news"
 
 
+def test_news_to_event_decodes_html_entities() -> None:
+    """Benzinga sends HTML-escaped text; it must reach triage and the UI decoded."""
+    ev = _news_to_event(
+        {
+            "id": 1,
+            "headline": "UBS Maintains Buy on McDonald&#39;s; S&amp;T Bancorp PT",
+            "summary": "&quot;Strong&quot; quarter",
+            "symbols": ["MCD"],
+            "created_at": "2026-06-04T10:30:00Z",
+        }
+    )
+    assert ev.headline == "UBS Maintains Buy on McDonald's; S&T Bancorp PT"
+    assert ev.body == '"Strong" quarter'
+
+
 def test_news_to_event_falls_back_when_headline_missing() -> None:
     ev = _news_to_event({"id": 1, "symbols": []})
     assert ev.headline == "(no headline)"
@@ -215,3 +230,58 @@ async def test_subscribe_tolerates_interleaved_success_messages(alpaca_env) -> N
     )
     await stream._subscribe(ws)  # type: ignore[arg-type]
     assert '"action": "subscribe"' in ws.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_connection_limit_406_is_transient_not_auth(alpaca_env) -> None:
+    """406 = the old session still holds the slot (e.g. right after a container
+    replace). It must take the normal retry path, not the auth-failure one."""
+    from app.data.types import ProviderUnavailable
+
+    stream = AlpacaNewsStream(bus=InMemoryEventBus())
+    ws = _FakeWS(['[{"T":"error","code":406,"msg":"connection limit exceeded"}]'])
+    with pytest.raises(RuntimeError, match="406") as exc:
+        await stream._authenticate(ws)  # type: ignore[arg-type]
+    assert not isinstance(exc.value, ProviderUnavailable)
+
+
+@pytest.mark.asyncio
+async def test_run_loop_survives_auth_rejection(
+    alpaca_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: an auth rejection used to re-raise out of _run(), killing the
+    task while the worker still reported RUNNING. Now the loop keeps retrying
+    and reports auth_failed."""
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    from app.discovery import alpaca_news_stream as mod
+
+    attempts = 0
+
+    @asynccontextmanager
+    async def fake_connect(*_: object, **__: object):  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        attempts += 1
+        yield _FakeWS(
+            [
+                '[{"T":"success","msg":"connected"}]',
+                '[{"T":"error","code":402,"msg":"auth failed"}]',
+            ]
+        )
+
+    monkeypatch.setattr(mod.websockets, "connect", fake_connect)
+    stream = AlpacaNewsStream(
+        bus=InMemoryEventBus(), initial_backoff_seconds=0.01, max_backoff_seconds=0.01
+    )
+    await stream.start()
+    for _ in range(100):
+        if attempts >= 3:
+            break
+        await asyncio.sleep(0.01)
+    assert attempts >= 3  # still reconnecting, not dead
+    assert stream.state in ("auth_failed", "reconnecting")
+    assert stream.auth_failed is True
+    assert "auth" in (stream.last_error or "")
+    await stream.stop()
+    assert stream.state == "stopped"

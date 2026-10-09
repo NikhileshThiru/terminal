@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 
+import { GraduationPanel } from '../GraduationPanel';
+
 import {
   getCalibration,
   getEvalOutcomes,
@@ -38,7 +40,14 @@ export function EvalPage() {
   useEffect(() => {
     let cancelled = false;
     getEvalSummary()
-      .then((s) => !cancelled && setSummary(s))
+      .then((s) => {
+        if (cancelled) return;
+        setSummary(s);
+        // Open on the bucket with the most graded outcomes — a calibration
+        // plot of 2 points says nothing; the user can still pick any bucket.
+        const busiest = [...s.buckets].sort((a, b) => b.count_resolved - a.count_resolved)[0];
+        if (busiest && busiest.count_resolved > 0) setActiveBucket(busiest.bucket);
+      })
       .catch((e: unknown) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
     getEvalOutcomes(undefined, 25)
       .then((o) => !cancelled && setOutcomes(o))
@@ -89,6 +98,8 @@ export function EvalPage() {
           />
         ))}
       </div>
+
+      <GraduationPanel />
 
       <div className="grid min-h-0 flex-1 gap-2 lg:grid-cols-[1.4fr_1fr]">
         <section className="border-border bg-bg-elevated flex min-h-[420px] flex-col overflow-hidden rounded border">

@@ -80,3 +80,29 @@ def test_set_rejects_nonpositive_ttl() -> None:
         asyncio.run(c.set("k", "v", ttl_seconds=0))
     with pytest.raises(ValueError):
         asyncio.run(c.set("k", "v", ttl_seconds=-1))
+
+
+@pytest.mark.asyncio
+async def test_expired_keys_are_swept_without_being_read() -> None:
+    """Regression: rotating keys that are never re-read used to live forever."""
+    clock = FakeClock()
+    cache = InMemoryCache(clock=clock, sweep_every=4)
+    for i in range(3):
+        await cache.set(f"ohlc:AAPL:day{i}", i, ttl_seconds=10)
+    clock.advance(11)
+    await cache.set("fresh", "x", ttl_seconds=10)  # 4th write triggers a sweep
+    assert len(cache) == 1
+    assert await cache.get("fresh") == "x"
+
+
+@pytest.mark.asyncio
+async def test_size_cap_evicts_oldest_written() -> None:
+    cache = InMemoryCache(clock=FakeClock(), max_entries=2)
+    await cache.set("a", 1, ttl_seconds=100)
+    await cache.set("b", 2, ttl_seconds=100)
+    await cache.set("a", 11, ttl_seconds=100)  # rewrite moves "a" to newest
+    await cache.set("c", 3, ttl_seconds=100)
+    assert len(cache) == 2
+    assert await cache.get("b") is None
+    assert await cache.get("a") == 11
+    assert await cache.get("c") == 3

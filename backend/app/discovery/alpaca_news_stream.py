@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -107,6 +108,10 @@ class AlpacaNewsStream:
         self.last_message_at: datetime | None = None
         self.last_error: str | None = None
         self.connected = False
+        # True while the last handshake was rejected for credentials. The
+        # loop keeps retrying (at max backoff) so a fixed key recovers, and
+        # status() can say *why* no news is arriving.
+        self.auth_failed = False
 
     async def start(self) -> None:
         if self._task is not None and not self._task.done():
@@ -134,8 +139,26 @@ class AlpacaNewsStream:
         self.connected = False
         _log.info("alpaca_news_stopped")
 
+    @property
+    def state(self) -> str:
+        """connected | reconnecting | auth_failed | stopped | dead.
+
+        `dead` means the task exited without stop() — should be impossible
+        now, and is reported rather than hidden if it ever happens."""
+        if self._task is None:
+            return "stopped"
+        if self._task.done():
+            return "stopped" if self._stop_event.is_set() else "dead"
+        if self.connected:
+            return "connected"
+        return "auth_failed" if self.auth_failed else "reconnecting"
+
     async def _run(self) -> None:
-        """Connect-loop. Auto-reconnects with exponential backoff on drop."""
+        """Connect-loop. Auto-reconnects with exponential backoff on drop.
+
+        Never exits except via stop(): an exception that escaped this loop
+        used to kill the task silently while the worker kept reporting
+        RUNNING (the July 2026 review finding)."""
         backoff = self._initial_backoff
         while not self._stop_event.is_set():
             try:
@@ -145,6 +168,7 @@ class AlpacaNewsStream:
                     _log.info("alpaca_news_connected")
                     try:
                         await self._authenticate(ws)
+                        self.auth_failed = False
                         await self._subscribe(ws)
                         # Only a fully-established session resets backoff. A
                         # TCP connect that then fails the handshake must keep
@@ -155,9 +179,14 @@ class AlpacaNewsStream:
                     finally:
                         self.connected = False
                         self.disconnects += 1
-            except ProviderUnavailable:
-                # Auth issue — not retryable. Re-raise so .start() surfaces it.
-                raise
+            except ProviderUnavailable as e:
+                # Credentials rejected. Retrying fast is pointless, but dying is
+                # worse (start() has long returned; nobody would ever see it).
+                # Park at the slowest cadence and report auth_failed.
+                self.auth_failed = True
+                self.last_error = f"auth: {e.message}"
+                _log.error("alpaca_news_auth_failed", error=e.message)
+                backoff = self._max_backoff
             except (ConnectionClosed, WebSocketException, OSError) as e:
                 self.last_error = f"{type(e).__name__}: {e}"
                 _log.warning("alpaca_news_disconnected", error=str(e), backoff=backoff)
@@ -188,7 +217,12 @@ class AlpacaNewsStream:
                 continue  # "connected" greeting or other informational success
             if mtype == "error":
                 code = msg.get("code")
-                if code in (401, 402, 406):
+                if code == 406:
+                    # "connection limit exceeded": the previous session (e.g.
+                    # from the container we just replaced) still holds the
+                    # single free-tier slot. Transient — back off and retry.
+                    raise RuntimeError("Alpaca news connection limit exceeded (406); will retry")
+                if code in (401, 402):
                     raise ProviderUnavailable(
                         reason=ProviderUnavailableReason.AUTH_MISSING,
                         message=f"Alpaca news auth failed: {msg.get('msg')}",
@@ -312,8 +346,10 @@ def _decode(raw: str | bytes) -> list[dict[str, Any]]:
 def _news_to_event(msg: dict[str, Any]) -> DiscoveryEvent:
     """Translate an Alpaca news message to our DiscoveryEvent envelope."""
     symbols = [s.upper() for s in msg.get("symbols") or [] if isinstance(s, str)]
-    headline = (msg.get("headline") or "").strip()
-    body = (msg.get("summary") or msg.get("content") or "").strip() or None
+    # Benzinga sends HTML-escaped text ("Apple&#39;s", "S&amp;T"); decode once
+    # here so every downstream consumer (triage prompt, UI, replay) sees text.
+    headline = html.unescape(msg.get("headline") or "").strip()
+    body = html.unescape(msg.get("summary") or msg.get("content") or "").strip() or None
     published_at = msg.get("created_at") or msg.get("updated_at")
     try:
         ts = (

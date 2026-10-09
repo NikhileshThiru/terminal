@@ -51,9 +51,25 @@ export function ReasoningProvider({ children }: { children: ReactNode }) {
   const [thesis, setThesis] = useState<Thesis | null>(null);
   const [globalConnected, setGlobalConnected] = useState(false);
   const seqRef = useRef(0);
+  const seenRef = useRef<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
 
   const append = useCallback((evt: CopilotStreamEvent, origin: 'manual' | 'global') => {
+    // A manual run arrives twice — on its own stream and on the global
+    // broadcaster — in either order. Every event carries (run_id, seq), so
+    // render whichever copy lands first and drop the other.
+    const runId = evt.payload?.run_id;
+    const runSeq = evt.payload?.seq;
+    if (runId !== undefined && runSeq !== undefined) {
+      const key = `${String(runId)}:${String(runSeq)}`;
+      if (seenRef.current.has(key)) return;
+      seenRef.current.add(key);
+      if (seenRef.current.size > MAX_EVENTS * 4) {
+        // Bounded: forget the oldest keys (insertion order).
+        const keep = Array.from(seenRef.current).slice(-MAX_EVENTS * 2);
+        seenRef.current = new Set(keep);
+      }
+    }
     seqRef.current += 1;
     const id = seqRef.current;
     setEvents((prev) => {

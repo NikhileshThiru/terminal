@@ -7,7 +7,7 @@ LLM_TRIAGE_PROVIDER/MODEL (defaults to Gemini Flash Lite — cheap, fast).
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.core.logging import get_logger
 from app.discovery.types import DiscoveryEvent
@@ -20,8 +20,17 @@ class TriageDecision(BaseModel):
     """The triage gate's verdict."""
 
     passed: bool = Field(description="True if the event is worth a full thesis.")
-    reason: str = Field(min_length=3, max_length=300)
+    reason: str = Field(min_length=3, max_length=300, description="One sentence, under 300 chars.")
     confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _trim_reason(cls, v: object) -> object:
+        # A verbose model must not turn a valid pass/drop into a failed call
+        # (replay showed gpt-oss occasionally writing 300+ char reasons).
+        if isinstance(v, str) and len(v) > 300:
+            return v[:297].rstrip() + "…"
+        return v
 
 
 _SYSTEM_PROMPT = """You are the triage gate for an AI trading-research terminal.
@@ -44,6 +53,10 @@ NOT material (drop):
 - minor staffing changes, board re-elections, generic press releases
 - proxy materials, share-repurchase reauthorizations without size changes
 - index reconstitutions, ratings agency reaffirmations
+- price-target tweaks on a MAINTAINED rating ("Maintains Buy, lowers PT to
+  $480") — routine model upkeep; only a rating change (upgrade/downgrade/
+  initiation) counts as the analyst signal above
+- "why is X stock moving" recaps with no new underlying fact
 
 Return a calibrated confidence — not your enthusiasm. 0.5 = genuinely uncertain.
 """

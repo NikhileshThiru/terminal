@@ -257,3 +257,17 @@ async def test_get_earnings_surprises_parses_array() -> None:
     assert surprises[0].surprise == 0.15
     assert surprises[0].surprise_pct == 10.0
     await p.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_api_key_sent_in_header_never_in_url() -> None:
+    """The key used to ride in ?token=, so every httpx INFO log line and any
+    exception quoting the URL printed it."""
+    route = respx.get("https://finnhub.io/api/v1/quote").mock(
+        return_value=httpx.Response(200, json={"c": 312.06, "t": 1_780_000_000})
+    )
+    await _make_provider().get_quote("AAPL")
+    request = route.calls.last.request
+    assert "TEST_KEY" not in str(request.url)
+    assert request.headers["X-Finnhub-Token"] == "TEST_KEY"

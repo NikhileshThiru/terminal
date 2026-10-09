@@ -1,5 +1,9 @@
 # Step 9 plan — deferred earned features
 
+> **Closed out 2026-10-09.** Discord alerts, the persistent LLM usage log,
+> replay mode and the MCP server are built; Langfuse was cut (the usage log
+> answers the same questions). Kept below as the original plan, for the record.
+
 Written 2026-06-12, after the fresh-eyes redesign pass. These are the four
 remaining "earned" features from the rolling plan. None block the demo gate;
 all are independent of each other. Recommended order below is by
@@ -41,7 +45,7 @@ source bucket, suggested contract, grounding status, link to the dashboard.
 
 ---
 
-## 2. Persistent LLM usage log (observability, part 1)
+## 2. Persistent LLM usage log (observability, part 1) — **DONE 2026-10-09** (`llm_calls`, written by the LLM router)
 
 **What:** replace the process-scoped `CostTracker` singleton with a durable
 `llm_usage_log` table so cost survives restarts. The header chip then shows
@@ -59,7 +63,7 @@ all-time + session numbers.
 **Effort:** ~1 session. Do this BEFORE Langfuse so the data layer exists even
 if Langfuse is dropped later.
 
-## 3. Langfuse traces (observability, part 2)
+## 3. Langfuse traces (observability, part 2) — **CUT 2026-10-09** (needs an account or two more containers; `llm_calls` + correlation IDs cover it)
 
 **What:** ship every LLM call (triage + thesis + grounding retries) as a
 Langfuse trace, keyed by correlation ID, so a thesis's whole funnel is
@@ -81,7 +85,7 @@ inspectable as one trace tree.
 
 ---
 
-## 4. Replay mode (development quality-of-life)
+## 4. Replay mode (development quality-of-life) — **DONE 2026-10-09** (`python -m app.discovery.replay`, triage-only and read-only)
 
 **What:** re-consume stored discovery events through the funnel for offline
 debugging (DESIGN.md §9 Phase 6 calls this out). Today the injector covers
@@ -102,7 +106,7 @@ single synthetic events; replay covers "what would yesterday have looked like."
 
 ---
 
-## 5. MCP server (the "flex", build last)
+## 5. MCP server (the "flex", build last) — **DONE 2026-10-09** (`app/mcp_server.py`, seven read-only tools over the REST API)
 
 **What:** expose the system as MCP tools so Claude Desktop (or any MCP client)
 can query it: `get_positions`, `get_thesis_history(symbol)`, `get_eval_summary`,

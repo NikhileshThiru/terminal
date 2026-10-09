@@ -37,15 +37,15 @@ Start with the "v1" column. Move to "later" only when the listed trigger is actu
 | Backend | Python + FastAPI | — | — |
 | Python tooling | uv + ruff + mypy + pytest | — | — |
 | Agent orchestration | Plain tool-calling loop | LangGraph | When adding the human-in-the-loop approval + reasoning stream |
-| Event bus | Redis Streams | Redpanda (Kafka API) | Only if event volume genuinely demands it (it won't soon: ~130 news/day) |
+| Event bus | Redis Streams (consumer group, ACK after processing; separate `ingestion` container) — built 2026-10 | Redpanda (Kafka API) | Only if event volume genuinely demands it (it won't soon: ~800 events/day) |
 | Database | Plain PostgreSQL + Alembic migrations | + TimescaleDB, + pgvector | Timescale when stored quote volume is large; pgvector when building thesis-memory retrieval (so the agent can recall "last time NVDA reported, this is what I said and what happened") |
 | Durable workflows | Idempotent workers + Postgres state + process manager | Temporal | Only if restart-survival via Postgres proves insufficient |
 | Cache / hot state | Redis | — | — |
 | Frontend | React + TypeScript + Vite + vitest | — | — |
 | UI libs | Tailwind + shadcn/ui, lightweight-charts (candles), TanStack Table virtualized (options chain), Recharts or visx (payoff diagrams), TanStack Query, Zustand | — | — |
 | Realtime to browser | SSE for agent reasoning + alerts; WebSocket for live price ticks | — | — |
-| LLM | Gemini Flash (2.5 or 3, free) **+ Claude Haiku 4.5 (free tier)** — both behind a `LLMProvider` interface from day 1 | Local Ollama (Llama 3 / Qwen 2.5) as quota-exhaustion fallback | Swap via config; never hardcode a model. The dual-cloud setup proves the interface; document the local-LLM swap even before implementing it |
-| Observability | Structured logging (JSON, correlation IDs) + Langfuse (LLM traces, cost, latency) | — | — |
+| LLM | Gemini (several free Flash models) **+ Groq (free)** — behind a `LLMProvider` interface, composed per step by `LLMRouter` (ordered failover, quota-aware cooldowns, every call logged to `llm_calls`) | ~~Local Ollama~~ — cut 2026-10 (multi-GB download for a path the multi-model cloud chain already covers) | Swap via config; never hardcode a model. NO Anthropic provider: the Anthropic API has no free tier (2026), and the owner's Claude subscription must never be consumed by this project (decided 2026-07-07) |
+| Observability | Structured logging (JSON, correlation IDs) + durable `llm_calls` usage log (per-call provider/model/latency/tokens/outcome) + `/llm/health` route panel | ~~Langfuse~~ — cut 2026-10 (needs an account or two more containers; the usage log answers the same questions) | — |
 | Notifications | Discord bot | PWA + web-push | After core is done. No native mobile app |
 | Deployment | Run locally on dev Mac via docker-compose | Self-hosted 24/7 on an old laptop (Linux + Docker + free tunnel); ~$5/mo VPS as paid fallback | Move to the laptop when true 24/7 is wanted. See section 11. No Kubernetes |
 | CI | GitHub Actions (lint + typecheck + test on every push) | — | — |
@@ -135,8 +135,9 @@ Sources serve three distinct roles. Wire every one behind the data-access abstra
 ### Known free-tier limits (design around these, do not fight them)
 - Alpaca equities (Basic): real-time market coverage is IEX only (~2% of volume), websocket 30 symbols, historical 200 calls/min, historical data delayed by 15 min.
 - Alpaca options (Basic): Indicative Pricing Feed (an approximation, not the consolidated OPRA feed), websocket 200 option quotes, historical since 2016 at 15-min delay, 200 calls/min.
-- Gemini Flash (free): ~1,500 requests/day, 10 RPM. Tightening trend in 2026 — design as if it could shrink further. The triage gate + dedup keep usage well under this.
-- Claude Haiku 4.5 (free tier): rate-limited but generous; serves as the second cloud LLM behind the interface.
+- Gemini (free): **~20 requests/day PER MODEL** (observed 2026-10-09: 2.5-flash-lite 429'd "PerDay" after exactly 20 calls; resets midnight Pacific). Quotas are per model, so the thesis chain spans seven models (2.5-flash → 3.5 → 3.7 → 3.6 → 3-preview → 3.8 → 2.5-flash-lite). Gemini 3 requires `thought_signature` echoed on tool-calling turns (handled in `app/llm/gemini.py`, incl. cross-model failover). Measured capacity: a thesis is ~9 calls; the first live morning (2026-10-09) produced 10 theses before every free thesis model was parked at 10:17 ET — hence the reactive cap of 4/day to leave room for catalysts.
+- Groq (free): per model 1,000 RPD, 30 RPM, **8K tokens/minute** — and the TPM limiter counts the *requested* `max_tokens`. One multi-tool thesis request exceeds 8K, so Groq serves triage only. Models get retired (llama-3.3-70b-versatile 404s since 2026); a retired model surfaces as `MODEL_NOT_FOUND` and the router parks it.
+- Both providers' daily quotas were exhausted mid-session on 2026-07-07 — design for graceful quota exhaustion: the router fails over and parks routes until the upstream's own retry hint; when every route is parked, events are recorded as visible skips; a daily reactive-thesis cap (`autonomous_max_reactive_theses_per_day`) keeps quota for catalysts.
 - Finnhub (free): ~60 calls/min, advanced endpoints are premium.
 - There is no free consolidated (SIP) real-time stock data and no free real-time OPRA options data. This is permanent. Accept the delay; it is fine for a paper/learning project.
 
@@ -153,7 +154,7 @@ Every primary source has a documented fallback. When a circuit breaker opens on 
 | yfinance OHLC | stooq, Alpaca historical, Polygon.io | Several paths |
 | Finnhub (analyst, earnings cal) | SEC Form 4 + EDGAR earnings text + public Fed calendar | Lose analyst consensus; calendar derivable |
 | FRED (macro) | Treasury Direct + BLS public CSVs | Manual integration but bullet-proof |
-| Gemini Flash | Claude Haiku 4.5 (already wired) → local Ollama (Llama 3 / Qwen 2.5 small) | Local only for last-resort triage; thesis quality drops, log loudly |
+| LLM (per step) | `LLMRouter` chain from config: triage `groq:gpt-oss-20b → groq:gpt-oss-120b → gemini:3.1-flash-lite`; thesis across seven Gemini models | Each model is its own free quota. Ollama cut; no Anthropic fallback — see §3 |
 
 ---
 
@@ -195,11 +196,12 @@ Every primary source has a documented fallback. When a circuit breaker opens on 
     /api        routes, SSE, WebSocket
     /core       config, logging, correlation
     /data       interfaces, providers, cache, rate-limit, circuit-breaker
-    /llm        LLM provider interfaces (Gemini, Anthropic; Ollama later)
+    /llm        LLM providers (Gemini, Groq), router, quota parsing, health, usage log
     /agent      thesis funnel: tools, grounding, copilot orchestrator, schemas
-    /discovery  ingestion: event bus, EDGAR poller, triage, reactive runner
+    /discovery  ingestion service, Redis Streams bus, EDGAR poller, news WS, triage, reactive runner, replay
     /portfolio  paper engine, risk engine, account seed, ORM models
-    /eval       evaluation harness (scoring, persistence, models)
+    /eval       evaluation harness (scoring, persistence, graduation gate, models)
+    mcp_server.py  read-only MCP server over the REST API
   /alembic      database migrations
   /tests
 /frontend
@@ -224,10 +226,10 @@ DESIGN.md
   - **Score sources separately.** Manual-copilot theses, autonomous reactive theses, and autonomous catalyst-driven theses are three different distributions. Score them in three buckets, not one. Catalyst-driven theses may have measurable edge (deterministic timing); reactive theses almost certainly won't. Mixing them hides the truth.
   - **Calibration plot per bucket.** A graph of stated confidence vs realized hit rate — the most resume-impressive single artifact in the project.
 - **Paper engine.** Self-built. Fills against live quotes (mid price, or a small spread haircut for realism). Models options expiration and assignment. Runs two accounts: conservative (high threshold, smaller, safer) and aggressive (lower threshold, bigger, shorter-dated). The conservative/aggressive contrast IS the feature: it tests whether LLM confidence translates to position-sizing edge. A scheduled mark-to-market/reconciliation job revalues open positions and handles expirations, or the P&L silently lies.
-- **Shadow mode.** Before the autonomous agent places any paper trade, it runs in shadow: generates full theses and logs what it would have traded, committing nothing. **Explicit go/no-go criteria before graduating to paper trades:** at least 50 shadow theses logged AND grounding-check pass rate ≥ 95% AND Brier score on the shadow set no worse than the all-50/50 baseline (0.25). Below any of these: fix and re-shadow.
+- **Shadow mode.** Before the autonomous agent places any paper trade, it runs in shadow: generates full theses and logs what it would have traded, committing nothing. **Explicit go/no-go criteria before graduating to paper trades:** at least 50 shadow theses logged AND grounding-check pass rate ≥ 95% AND Brier score on the shadow set no worse than the all-50/50 baseline (0.25). Below any of these: fix and re-shadow. Reported live by `/eval/graduation` (Eval page panel); the grounding denominator comes from `thesis_attempts`, since rejected theses never reach `theses`.
 - **Catalyst calendar.** Scheduler of known events (earnings, Fed, FDA dates) so the agent pre-positions rather than only reacting. Earnings dates from Finnhub/yfinance; Fed/economic calendars are public.
 - **Discord bot.** Formatted phone alerts when a thesis is generated or a paper trade is placed (ticker, price, what happened, thesis summary, suggested trade, confidence, link to the app).
-- **Own MCP server (later flex).** Expose the system (paper engine, thesis history, scanner) as MCP tools so it can be queried from Claude Desktop. Build after the core works.
+- **Own MCP server — built 2026-10.** `app/mcp_server.py`: seven read-only tools (status, theses, scorecard, calibration, portfolio, news, catalysts) over the REST API. An MCP client *reads from* Terminal; Terminal never calls an Anthropic API.
 
 ---
 
@@ -239,11 +241,13 @@ DESIGN.md
 4. **Manual copilot.** Tool-calling loop + Gemini Flash + grounding check + typed thesis. First real AI product. Manual-copilot theses flow through the eval harness from this phase forward.
 5. **Eval harness (full).** Calibration plots, per-bucket scoring, dashboard. The harness was scaffolded in Phase 1; this phase makes it the visible artifact.
 
-**Demo gate.** Before starting Phase 6: record a screen-capture demo of the manual copilot (~90 seconds), populate `docs/demo.md` with the walkthrough, take dashboard screenshots, write a first "what I learned" pass on the README. Phases 1–5 are the guaranteed-strong portfolio piece; this gate ensures it ships polished even if Phases 6–8 stall.
+**Demo gate.** Screenshots only — no video walkthrough (owner decision 2026-10-09). `docs/demo.md` is a screenshot tour; README "The screens" shows the same captures; plus a "what I learned" pass on the README. Phases 1–5 are the guaranteed-strong portfolio piece; this gate ensures it ships polished.
 
 6. **Discovery pipeline.** Ingestion service (always-on), Redis Streams bus, dedup, Flash triage. Add replay mode (consume from stored event log for offline debugging) and a synthetic-event injector for development.
 7. **Autonomous agent.** Shadow mode first, then paper trades. Risk/guardrail layer, paper engine, two accounts (conservative + aggressive), reconciliation job, catalyst calendar.
 8. **Notifications + earned upgrades.** Discord bot. Then, only as earned: MCP server, PWA, LangGraph approval flow, Timescale/pgvector (when thesis-memory retrieval is built), and (rarely) Redpanda/Temporal.
+
+**Status (2026-10-09): finished.** Phases 1–8 done, including Discord alerts, Redis Streams + separate ingestion service, LLM usage log + replay mode, and the MCP server. Deliberately cut: Langfuse, local Ollama, the flag scanner (discovery runs on news + EDGAR), PWA, LangGraph approval flow, Timescale/pgvector. The eval grades every thesis over its own prediction window (`OutcomeResolver`, see ADR-0008); the shadow→paper go/no-go is reported at `/eval/graduation` and never flips automatically.
 
 Finish phases 1 to 5 (including the demo gate) before depending on anything in 6 to 8. A complete copilot + eval harness is already a strong, finished portfolio project on its own.
 

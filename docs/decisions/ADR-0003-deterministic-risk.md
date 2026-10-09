@@ -100,3 +100,29 @@ Concretely:
 - DESIGN.md §2 ("Evaluate, don't trust"), §8 (deterministic risk).
 - README "What I learned" — Phase 4.5 (GOOG hallucination), Phase 7 (shadow trades, deterministic risk).
 - `app/portfolio/risk.py` — the engine itself.
+
+## Clarification (2026-10): the `min_confidence` account filter
+
+A code review flagged an apparent contradiction: this ADR rejects "gate on
+confidence", yet each paper account has a `min_confidence` threshold and
+`RiskEngine.evaluate` rejects theses below it. The earlier wording ("never
+the LLM's own self-assessment as the gate") overstated the rule. The precise
+rule is:
+
+- Confidence may **filter** which theses an account considers — that filter
+  *is* the conservative-vs-aggressive experiment (DESIGN.md §8): same
+  theses, different thresholds, and the eval harness measures whether the
+  higher-threshold account actually does better. Without the filter there
+  is no experiment.
+- Confidence may **never authorize risk on its own**: every trade that
+  clears the filter must still pass the budget, per-trade cost,
+  daily-count, concurrent-position and kill-switch gates, and sizing is
+  clamped by code. A 0.99-confidence thesis gets no more contracts and no
+  exemption from any cap.
+- Confidence never **scales size**. That is the "calibration multiplier"
+  alternative above, still rejected.
+- All of this runs in shadow/paper only (ADR-0005), so no real order is
+  ever conditioned on a model's self-report.
+
+If the calibration plot shows confidence carries no signal, the filter is
+dropped and both accounts differ only on cost/count caps — a config change.

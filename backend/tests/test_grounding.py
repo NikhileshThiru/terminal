@@ -19,18 +19,19 @@ from app.agent.tools import ToolResult
 def test_extract_numbers_handles_dollars_percent_decimals() -> None:
     text = "AAPL last traded at $312.06, beat earnings by 10.86%, with 1.5 million volume."
     out = _extract_numbers(text)
-    # We should pick up 312.06, 10.86, 1.5 at minimum.
-    assert 312.06 in out
-    assert 10.86 in out
-    assert 1.5 in out
+    # We should pick up 312.06, 10.86, 1.5 at minimum — with written precision.
+    assert (312.06, 2) in out
+    assert (10.86, 2) in out
+    assert (1.5, 1) in out
 
 
 def test_extract_numbers_skips_dollar_prefix_attached_to_letter_or_id() -> None:
     text = "Ticker$ABC and account_id_3 should be ignored, but 42 counts."
     out = _extract_numbers(text)
-    assert 42 in out
+    values = [v for v, _ in out]
+    assert 42 in values
     # The regex's lookbehind blocks numbers attached to letters/underscores.
-    assert 3 not in out  # part of account_id_3
+    assert 3 not in values  # part of account_id_3
 
 
 def test_is_year_like() -> None:
@@ -61,17 +62,26 @@ def test_collect_numbers_walks_nested_dict_and_list() -> None:
 
 
 def test_close_matches_exact() -> None:
-    assert _close(5.0, 5.0)
+    assert _close(5.0, 0, 5.0)
 
 
-def test_close_within_abs_tol() -> None:
-    assert _close(5.0, 5.3, abs_tol=0.5)
-    assert not _close(5.0, 6.0, abs_tol=0.5, rel_tol=0.0)
+def test_close_tolerance_scales_with_written_precision() -> None:
+    # "$5" (0 decimals) can be a rounding of 5.3; "$5.0" cannot.
+    assert _close(5.0, 0, 5.3)
+    assert not _close(5.0, 1, 5.3)
+    # "$4.60" is a claim precise to the cent — 4.10 is NOT its source.
+    # (The old flat ±0.5 tolerance matched this: an invented premium passed.)
+    assert not _close(4.60, 2, 4.10)
+    assert _close(4.60, 2, 4.60)
 
 
-def test_close_within_rel_tol() -> None:
-    assert _close(100.0, 101.5, rel_tol=0.02)  # 1.5% diff
-    assert not _close(100.0, 120.0, rel_tol=0.02)  # 20% diff
+def test_close_relative_tolerance_only_for_large_aggregates() -> None:
+    # Share volumes / market caps: rounding to millions is legitimate.
+    assert _close(38_000_000.0, 0, 38_392_499.0)  # ~1% diff, large scale
+    # Price-scale numbers get NO percent slack — 2% of a stock price was
+    # enough to "ground" invented figures against a dense options chain.
+    assert not _close(100.0, 0, 102.0)  # 2% diff at price scale
+    assert not _close(152.0, 1, 155.0)
 
 
 # === The check itself ===
@@ -177,3 +187,49 @@ def test_failed_tool_results_do_not_provide_numbers() -> None:
     r = check_grounding(reasoning, [failed])
     assert r.passed is False
     assert 312.06 in r.unverified_numbers
+
+
+def test_invented_premium_fails_against_dense_chain_numbers() -> None:
+    """Regression: with the old flat ±0.5 tolerance, a fabricated $4.60
+    premium "verified" against a chain quoting 4.10/4.30. Precision-aware
+    matching rejects it — the model wrote cents, so it must match to cents."""
+    reasoning = "The 315 call premium is $4.60, a bargain."
+    tools = [
+        _result(
+            "get_options_chain",
+            {"contracts": [{"strike": 315, "bid": 4.10, "ask": 4.30}]},
+        )
+    ]
+    r = check_grounding(reasoning, tools)
+    assert r.passed is False
+    assert 4.6 in r.unverified_numbers
+
+
+def test_whitelisted_constant_written_as_price_is_still_verified() -> None:
+    """Regression: 100/30/52/12/7 were exempt everywhere, so an invented
+    "$100 target" or "$30 strike" skipped grounding entirely. Only the bare
+    arithmetic form ("x 100 shares", "30 days") is exempt now."""
+    from datetime import UTC, datetime
+
+    from app.agent.grounding import check_grounding
+    from app.agent.tools import ToolResult
+
+    data = [
+        ToolResult(
+            tool_name="get_quote",
+            arguments={"symbol": "AAPL"},
+            success=True,
+            data={"last": 312.06},
+            provider="test",
+            fetched_at=datetime.now(UTC),
+        )
+    ]
+    arithmetic = check_grounding("AAPL at $312.06; 1 contract x 100 shares over 30 days.", data)
+    assert arithmetic.passed
+
+    invented_target = check_grounding("AAPL at $312.06 with a $100 downside target.", data)
+    assert not invented_target.passed
+    assert 100.0 in invented_target.unverified_numbers
+
+    invented_decimal = check_grounding("AAPL at $312.06; IV rank 52.00.", data)
+    assert not invented_decimal.passed

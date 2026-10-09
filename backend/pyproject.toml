@@ -19,13 +19,13 @@ dependencies = [
     "python-multipart>=0.0.12",
     # LLM SDKs — wired behind the LLMProvider interface (DESIGN.md §3)
     "google-genai>=0.3",
-    "anthropic>=0.40",
     # Data providers (Phase 2 work, included now so we can use them tonight)
     "yfinance>=0.2.50",
     "edgartools>=3.0",
     # Numerical
     "pandas>=2.2",
     "numpy>=2.0",
+    "mcp>=1.10",
 ]
 
 [dependency-groups]
@@ -38,6 +38,7 @@ dev = [
     "respx>=0.21",
     "vcrpy>=6.0",
     "freezegun>=1.5",
+    "fakeredis>=2.26",
 ]
 
 [build-system]

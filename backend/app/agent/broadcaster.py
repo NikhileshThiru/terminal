@@ -62,14 +62,25 @@ class AgentEventBroadcaster:
                 except Exception:
                     _log.warning("broadcaster_queue_drop_failed")
 
-    async def stream(self) -> AsyncIterator[CopilotEvent]:
+    async def stream(self, idle_seconds: float | None = None) -> AsyncIterator[CopilotEvent | None]:
         """Subscribe + iterate. The consumer should run inside a try/finally
-        so cancellation removes the queue from the subscriber set."""
+        so cancellation removes the queue from the subscriber set.
+
+        With `idle_seconds`, yields `None` whenever that long passes with no
+        event — the SSE endpoint turns it into a keepalive tick. (The wait has
+        to live here: a consumer blocked inside `q.get()` never gets control
+        back during exactly the quiet window a heartbeat exists for.)"""
         q: asyncio.Queue[CopilotEvent] = asyncio.Queue(maxsize=self._MAX_QUEUE)
         self._subscribers.add(q)
         try:
             while True:
-                yield await q.get()
+                if idle_seconds is None:
+                    yield await q.get()
+                    continue
+                try:
+                    yield await asyncio.wait_for(q.get(), timeout=idle_seconds)
+                except TimeoutError:
+                    yield None
         finally:
             self._subscribers.discard(q)
 

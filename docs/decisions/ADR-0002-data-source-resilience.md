@@ -61,8 +61,9 @@ fetch**.
 ```
 
 **TTL cache** (`app/data/cache.py`): in-memory dict, async-safe, per-key
-expiry. Interface allows swapping to Redis (Phase 6+) without touching
-providers.
+expiry, bounded (size cap + periodic sweep of expired keys — added 2026-10
+after a review found date-stamped keys accumulating forever in the 24/7
+worker). Interface allows swapping to Redis without touching providers.
 
 **Token-bucket rate limiter** (`app/data/rate_limit.py`): one bucket per
 provider, sized to the source's published limit. `acquire()` blocks; no

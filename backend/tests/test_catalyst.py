@@ -372,3 +372,117 @@ def test_prompt_includes_event_metadata() -> None:
     assert "1.93" in prompt
     assert "after market close" in prompt
     assert "$90,000,000,000" in prompt
+
+
+@pytest.mark.asyncio
+async def test_scheduler_defers_while_market_closed(
+    configured_persistence, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Market-hours gate (CLAUDE.md §7): off-session ticks fire nothing and
+    the event stays SCHEDULED, so the next open-hours tick triggers it
+    against live quotes. Nothing is lost by waiting."""
+    from app.discovery import catalyst_scheduler as sched_mod
+
+    factory = configured_persistence
+    await _seed_catalyst(factory, symbol="AAPL", days_out=1)
+    scheduler = CatalystScheduler(
+        copilot=FakeCopilot(),
+        session_factory=factory,
+        lead_days=2,
+        enforce_market_hours=True,
+    )
+
+    monkeypatch.setattr(sched_mod, "is_market_open", lambda _now: False)
+    closed = await scheduler.run_once()
+    assert closed.triggered == 0
+    assert closed.candidates == 0
+    async with factory() as session:
+        row = (await session.execute(select(CatalystEvent))).scalar_one()
+    assert row.state == CatalystEventState.SCHEDULED.value
+
+    # Market opens: the same event fires normally.
+    monkeypatch.setattr(sched_mod, "is_market_open", lambda _now: True)
+    opened = await scheduler.run_once()
+    assert opened.triggered == 1
+
+
+@pytest.mark.asyncio
+async def test_crash_mid_tick_does_not_refire_already_written_thesis(
+    configured_persistence,
+) -> None:
+    """Regression: the thesis committed immediately but the event's TRIGGERED
+    state only at end of tick, so a crash between them re-fired the event on
+    the next tick (duplicate thesis, double-counted in the eval)."""
+    from app.eval.models import Thesis as ThesisRow
+
+    class _Crash(BaseException):  # escapes run_once's `except Exception`, like a kill
+        pass
+
+    factory = configured_persistence
+    await _seed_catalyst(factory, symbol="AAPL", days_out=1)
+    await _seed_catalyst(factory, symbol="MSFT", days_out=2)
+
+    copilot = FakeCopilot()
+    original = copilot.generate
+
+    async def generate_then_crash(prompt: str, **kwargs: Any) -> Any:
+        if len(copilot.calls) == 1:  # second event: the process "dies"
+            raise _Crash()
+        return await original(prompt, **kwargs)
+
+    copilot.generate = generate_then_crash  # type: ignore[method-assign]
+    scheduler = CatalystScheduler(copilot=copilot, session_factory=factory, lead_days=2)
+    with pytest.raises(_Crash):
+        await scheduler.run_once()
+
+    # "Restart": a fresh scheduler must only pick up the event that never fired.
+    fresh = FakeCopilot()
+    result = await CatalystScheduler(copilot=fresh, session_factory=factory, lead_days=2).run_once()
+    assert result.candidates == 1
+    assert "MSFT" in fresh.calls[0]["prompt"]
+    async with factory() as session:
+        theses = (await session.execute(select(ThesisRow))).scalars().all()
+    assert len(theses) == 2  # one per event, no duplicate
+
+
+def test_lead_window_counts_trading_days_not_calendar_days() -> None:
+    from app.discovery.catalyst_scheduler import add_trading_days
+
+    # Friday + 2 trading days = Tuesday: a Monday report is inside Friday's window.
+    assert add_trading_days(date(2026, 10, 9), 2) == date(2026, 10, 13)
+    assert add_trading_days(date(2026, 10, 12), 2) == date(2026, 10, 14)  # Mon -> Wed
+
+
+@pytest.mark.asyncio
+async def test_same_day_pre_market_report_is_not_fired_after_the_fact(
+    configured_persistence,
+) -> None:
+    """A BMO report is public by the first open-hours tick; a thesis written
+    then would read the results it's supposed to predict. Only an after-close
+    (amc) report may still fire on its own day."""
+    factory = configured_persistence
+    async with factory() as session:
+        for symbol, hour in (("BMO", "bmo"), ("AMC", "amc"), ("UNK", None)):
+            session.add(
+                CatalystEvent(
+                    symbol=symbol,
+                    event_type=CatalystEventType.EARNINGS.value,
+                    event_date=_today_et(),
+                    event_hour=hour,
+                    state=CatalystEventState.SCHEDULED.value,
+                    scheduled_at=datetime.now(UTC),
+                )
+            )
+        await session.commit()
+    copilot = FakeCopilot()
+    result = await CatalystScheduler(
+        copilot=copilot, session_factory=factory, lead_days=2
+    ).run_once()
+    assert result.candidates == 1
+    assert "AMC" in copilot.calls[0]["prompt"]
+
+
+def _today_et() -> date:
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).date()

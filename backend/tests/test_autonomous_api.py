@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, ClassVar
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.discovery import worker as worker_module
+from app.discovery.reactive import ReactiveStats
 from app.eval import persistence
 from app.eval.models import Base
 from app.eval.models import Thesis as ThesisRow
@@ -31,19 +32,7 @@ class _NoopPoller:
 
 
 class _NoopRunner:
-    class _Stats:
-        events_consumed = 0
-        events_passed_triage = 0
-        theses_produced = 0
-        triage_failures = 0
-        thesis_failures = 0
-        persistence_failures = 0
-        last_event_at = None
-        last_thesis_at = None
-        last_error = None
-        last_triage_decisions: ClassVar[list[dict[str, Any]]] = []
-
-    stats = _Stats()
+    stats = ReactiveStats()
 
     def __init__(self, *_: Any, **__: Any) -> None: ...
     async def start(self) -> None: ...
@@ -95,6 +84,8 @@ class _NoopNewsStream:
     events_published = 0
     duplicates_dropped = 0
     last_message_at = None
+    state = "connected"
+    last_error = None
 
     def __init__(self, *_: Any, **__: Any) -> None: ...
 
@@ -122,15 +113,16 @@ async def _stub_everything(monkeypatch: pytest.MonkeyPatch):
     """Isolate worker dependencies + DB across tests."""
     # Reset the singleton so each test gets a fresh worker.
     worker_module.get_worker.cache_clear()
-    monkeypatch.setattr(worker_module, "EdgarPoller", _NoopPoller)
+    from app.discovery import ingest as ingest_module
+
+    monkeypatch.setattr(ingest_module, "EdgarPoller", _NoopPoller)
     monkeypatch.setattr(worker_module, "ReactiveRunner", _NoopRunner)
-    monkeypatch.setattr(worker_module, "EdgarFilingsProvider", lambda *_, **__: _NoopEdgar())
-    monkeypatch.setattr(worker_module, "_build_triage_llm", lambda _: _NoopLLM())
+    monkeypatch.setattr(worker_module, "get_router", lambda _: _NoopLLM())
     monkeypatch.setattr(worker_module, "build_copilot", lambda: _NoopCopilot())
     monkeypatch.setattr(worker_module, "ReconciliationJobs", _NoopReconciliation)
     monkeypatch.setattr(worker_module, "get_mtm_service", lambda: None)
     monkeypatch.setattr(worker_module, "get_outcome_resolver", lambda: None)
-    monkeypatch.setattr(worker_module, "AlpacaNewsStream", _NoopNewsStream)
+    monkeypatch.setattr(ingest_module, "AlpacaNewsStream", _NoopNewsStream)
     monkeypatch.setattr(worker_module, "CatalystJobs", _NoopCatalystJobs)
     monkeypatch.setattr(worker_module, "FinnhubProvider", lambda *_, **__: None)
     monkeypatch.setattr(worker_module, "CalendarFetcher", lambda *_, **__: None)

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app.data.circuit_breaker import CircuitBreaker, CircuitOpen, CircuitState
+
+
+async def _fail() -> None:
+    raise RuntimeError("upstream down")
 
 
 class FakeClock:
@@ -135,3 +141,56 @@ def test_rejects_invalid_threshold() -> None:
 def test_rejects_invalid_recovery_timeout() -> None:
     with pytest.raises(ValueError):
         CircuitBreaker(name="t", failure_threshold=1, recovery_timeout=0)
+
+
+@pytest.mark.asyncio
+async def test_half_open_admits_exactly_one_concurrent_probe() -> None:
+    """Regression: HALF_OPEN used to let every concurrent caller through."""
+    clock = FakeClock()
+    cb = CircuitBreaker(name="t", failure_threshold=1, recovery_timeout=10, clock=clock)
+    with pytest.raises(RuntimeError):
+        await cb.call(_fail)
+    clock.advance(11)
+
+    release = asyncio.Event()
+    probe_calls = 0
+
+    async def slow_probe() -> str:
+        nonlocal probe_calls
+        probe_calls += 1
+        await release.wait()
+        return "ok"
+
+    probe = asyncio.create_task(cb.call(slow_probe))
+    await asyncio.sleep(0)  # let the probe take the slot
+    with pytest.raises(CircuitOpen):
+        await cb.call(slow_probe)  # concurrent caller is turned away
+    release.set()
+    assert await probe == "ok"
+    assert probe_calls == 1
+    assert cb.state == CircuitState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_cancelled_probe_releases_slot() -> None:
+    clock = FakeClock()
+    cb = CircuitBreaker(name="t", failure_threshold=1, recovery_timeout=10, clock=clock)
+    with pytest.raises(RuntimeError):
+        await cb.call(_fail)
+    clock.advance(11)
+
+    async def hang() -> str:
+        await asyncio.Event().wait()
+        return "never"
+
+    probe = asyncio.create_task(cb.call(hang))
+    await asyncio.sleep(0)
+    probe.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await probe
+
+    async def ok() -> str:
+        return "ok"
+
+    assert await cb.call(ok) == "ok"  # next caller can probe; breaker not wedged
+    assert cb.state == CircuitState.CLOSED

@@ -24,11 +24,13 @@ Strictness baked in (post-GOOG-hallucination):
 
 from __future__ import annotations
 
+import itertools
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 from pydantic import ValidationError
@@ -39,6 +41,7 @@ from app.agent.tools import ToolRegistry, ToolResult
 from app.agent.tools import _strip_pydantic_schema_keys as _strip_schema
 from app.core.correlation import get_correlation_id, new_correlation_id
 from app.core.logging import get_logger
+from app.core.market_hours import eastern_today
 from app.llm.interface import (
     AgentMessage,
     AgentToolDef,
@@ -122,7 +125,7 @@ def _build_system_prompt(risk_budget_usd: float | None) -> str:
         risk_text = "no explicit limit; keep max_risk_usd around $500 by default."
     else:
         risk_text = f"${risk_budget_usd:.2f} (HARD CAP — do not exceed)."
-    today = datetime.now(UTC).date().isoformat()
+    today = eastern_today().isoformat()
     return SYSTEM_PROMPT_TEMPLATE.format(
         min_tool_calls=_MIN_DATA_TOOL_CALLS_BEFORE_FINAL,
         today=today,
@@ -168,11 +171,21 @@ class CopilotEvent:
 EventSink = Callable[[CopilotEvent], Awaitable[None]]
 
 
+# (run id, per-run sequence) for the run executing in this asyncio context.
+# Stamped on every event so a client receiving the same run twice — the
+# Ask-the-Agent page reads both its own stream and the global broadcaster —
+# can de-duplicate exactly (it used to render every step twice).
+_run_ctx: ContextVar[tuple[str, Iterator[int]] | None] = ContextVar("copilot_run", default=None)
+
+
 async def _emit(sink: EventSink | None, kind: CopilotEventKind, payload: dict[str, Any]) -> None:
     """Emit one event. Always fans out to the global broadcaster so anyone
     listening on /agent/events/stream sees every run (manual, reactive,
     catalyst); optionally also calls a per-run sink for the request that
     initiated the run."""
+    run = _run_ctx.get()
+    if run is not None:
+        payload = {**payload, "run_id": run[0], "seq": next(run[1])}
     event = CopilotEvent(kind=kind, payload=payload)
     # Global fan-out — local import to avoid a circular dependency between
     # copilot.py and broadcaster.py (which imports CopilotEvent from here).
@@ -191,8 +204,32 @@ async def _emit(sink: EventSink | None, kind: CopilotEventKind, payload: dict[st
         _log.exception("copilot_event_sink_raised", kind=kind)
 
 
+@dataclass(frozen=True)
+class AttemptRecord:
+    """One thesis attempt's fate — persisted to `thesis_attempts` so the
+    grounding pass rate has an honest denominator (rejected theses are never
+    written to `theses`, so that table alone always reads 100%)."""
+
+    source_bucket: str
+    outcome: Literal["grounded", "grounding_rejected", "failed"]
+    correlation_id: str
+    latency_ms: int
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    detail: str | None = None
+
+
+AttemptSink = Callable[[AttemptRecord], Awaitable[None]]
+
+
 class CopilotError(Exception):
     """Raised when the orchestrator cannot produce a valid thesis."""
+
+
+class GroundingRejected(CopilotError):
+    """The thesis cited numbers that don't trace to fetched tool data, even
+    after the bounded retry. Distinct from other failures because the
+    shadow-graduation gate measures exactly this rate (CLAUDE.md §8)."""
 
 
 class Copilot:
@@ -205,8 +242,10 @@ class Copilot:
         max_iterations: int = 10,
         temperature: float = 0.2,
         max_grounding_retries: int = 1,
+        attempt_sink: AttemptSink | None = None,
     ) -> None:
         self.llm = llm
+        self.attempt_sink = attempt_sink
         self.registry = registry
         self.model = model
         self.max_iterations = max_iterations
@@ -220,12 +259,90 @@ class Copilot:
         risk_budget_usd: float | None = None,
         source_bucket: SourceBucket = "manual",
         event_sink: EventSink | None = None,
+        record_attempt: bool = True,
     ) -> CopilotRun:
+        """Run the funnel for one thesis; record the attempt's fate either way
+        (unless `record_attempt=False`: synthetic dry runs must not touch the
+        eval's grounding denominator)."""
         correlation_id = get_correlation_id() or new_correlation_id()
+        started = time.monotonic()
+        # Bound once per call: the copilot is a shared singleton, so this must
+        # not live on `self` (concurrent runs would flip each other's flag).
+        sink = self.attempt_sink if record_attempt else None
+        run_token = _run_ctx.set((correlation_id, itertools.count(1)))
+        try:
+            run = await self._generate(
+                user_thesis,
+                risk_budget_usd=risk_budget_usd,
+                source_bucket=source_bucket,
+                event_sink=event_sink,
+                correlation_id=correlation_id,
+            )
+        except GroundingRejected as e:
+            await self._record_attempt(
+                sink, source_bucket, "grounding_rejected", correlation_id, started, str(e)
+            )
+            raise
+        except CopilotError as e:
+            await self._record_attempt(
+                sink, source_bucket, "failed", correlation_id, started, str(e)
+            )
+            raise
+        finally:
+            _run_ctx.reset(run_token)
+        await self._record_attempt(
+            sink,
+            source_bucket,
+            "grounded",
+            correlation_id,
+            started,
+            provider=run.thesis.llm_provider,
+            model=run.thesis.llm_model,
+        )
+        return run
+
+    @staticmethod
+    async def _record_attempt(
+        sink: AttemptSink | None,
+        source_bucket: str,
+        outcome: Literal["grounded", "grounding_rejected", "failed"],
+        correlation_id: str,
+        started: float,
+        detail: str | None = None,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        if sink is None:
+            return
+        try:
+            await sink(
+                AttemptRecord(
+                    source_bucket=source_bucket,
+                    outcome=outcome,
+                    correlation_id=correlation_id,
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                    llm_provider=provider,
+                    llm_model=model,
+                    detail=detail[:500] if detail else None,
+                )
+            )
+        except Exception as e:  # bookkeeping must never fail a thesis
+            _log.warning("thesis_attempt_record_failed", error=str(e)[:200])
+
+    async def _generate(
+        self,
+        user_thesis: str,
+        *,
+        risk_budget_usd: float | None,
+        source_bucket: SourceBucket,
+        event_sink: EventSink | None,
+        correlation_id: str,
+    ) -> CopilotRun:
         started = time.monotonic()
         tool_results: list[ToolResult] = []
         data_tool_call_count = 0
-        chain_fetches: dict[str, set[str]] = {}  # underlying → set of OCC symbols fetched
+        chain_fetches: dict[str, dict[str, _FetchedContract]] = {}  # underlying → occ → data
 
         all_tools: list[AgentToolDef] = self.registry.agent_defs()
         all_tools.append(_final_thesis_tool_def())
@@ -251,6 +368,9 @@ class Copilot:
         draft: ThesisDraft | None = None
         grounding_retries_used = 0
         iterations = 0
+        # Provenance: the router can fail over mid-conversation, so record
+        # whoever served the most recent turn rather than the configured primary.
+        served_provider, served_model = self.llm.name, self.model
 
         for iterations in range(1, self.max_iterations + 1):
             try:
@@ -262,6 +382,8 @@ class Copilot:
                 )
             except Exception as e:
                 raise CopilotError(f"LLM call failed at iteration {iterations}: {e}") from e
+            served_provider = turn.provider or served_provider
+            served_model = turn.model or served_model
 
             # Record the assistant's turn in the conversation history.
             conversation.append(
@@ -456,12 +578,12 @@ class Copilot:
             generated_at=datetime.now(UTC),
             grounding_check_passed=grounding.passed,
             grounding_notes=grounding.notes,
-            llm_provider=self.llm.name,
-            llm_model=self.model,
+            llm_provider=served_provider,
+            llm_model=served_model,
             funnel_latency_ms=elapsed_ms,
         )
         if not grounding.passed:
-            raise CopilotError(
+            raise GroundingRejected(
                 f"Grounding failed after {grounding_retries_used} retries. "
                 f"Unverified numbers: {grounding.unverified_numbers[:8]}. "
                 f"Notes: {grounding.notes}"
@@ -478,7 +600,7 @@ class Copilot:
         args: dict[str, Any],
         *,
         data_tool_call_count: int,
-        chain_fetches: dict[str, set[str]],
+        chain_fetches: dict[str, dict[str, _FetchedContract]],
         risk_budget_usd: float | None,
     ) -> _FinalThesisCheck:
         if data_tool_call_count < _MIN_DATA_TOOL_CALLS_BEFORE_FINAL:
@@ -498,7 +620,19 @@ class Copilot:
             )
 
         contract = draft.suggested_contract
-        underlying_chains = chain_fetches.get(contract.underlying.upper(), set())
+        # A single-leg long option IS the directional view: long -> call,
+        # short -> put. A "long" thesis expressed as a put (seen 3x in July's
+        # data: NFLX, ALNY, CC) leaves the eval grading the direction field
+        # while the trade bet the opposite way.
+        expected_type = "call" if draft.direction == "long" else "put"
+        if contract.option_type != expected_type:
+            return _FinalThesisCheck.fail(
+                f"direction '{draft.direction}' contradicts the suggested "
+                f"{contract.option_type}: a {draft.direction} thesis is expressed by buying a "
+                f"{expected_type}. Either flip `direction` to match your reasoning, or pick a "
+                f"{expected_type} from the chain."
+            )
+        underlying_chains = chain_fetches.get(contract.underlying.upper(), {})
         if contract.occ_symbol not in underlying_chains:
             available_sample = sorted(underlying_chains)[:5]
             return _FinalThesisCheck.fail(
@@ -507,6 +641,27 @@ class Copilot:
                 f"or call get_options_chain first. "
                 f"Examples from your fetched chain: {available_sample}"
             )
+
+        # The occ symbol alone isn't enough: an invented strike or premium on
+        # a REAL contract corrupts the fill price, max_risk, and eval P&L.
+        # Verify both against what the fetched chain actually said.
+        fetched = underlying_chains[contract.occ_symbol]
+        if fetched.strike is not None and Decimal(str(contract.strike)) != fetched.strike:
+            return _FinalThesisCheck.fail(
+                f"strike {contract.strike} does not match the fetched chain's "
+                f"{fetched.strike} for {contract.occ_symbol}. Use the strike "
+                "exactly as returned by get_options_chain."
+            )
+        if fetched.bid is not None and fetched.ask is not None and fetched.bid > 0 < fetched.ask:
+            premium = Decimal(str(contract.estimated_premium_per_contract))
+            lo = fetched.bid * Decimal("0.9")
+            hi = fetched.ask * Decimal("1.1")
+            if not lo <= premium <= hi:
+                return _FinalThesisCheck.fail(
+                    f"estimated_premium_per_contract {premium} is outside the fetched "
+                    f"bid/ask ({fetched.bid}/{fetched.ask}) for {contract.occ_symbol}. "
+                    "Use a premium consistent with the chain you fetched."
+                )
 
         if risk_budget_usd is not None and float(contract.max_risk_usd) > risk_budget_usd:
             return _FinalThesisCheck.fail(
@@ -548,7 +703,7 @@ class Copilot:
         conversation: list[AgentMessage],
         all_tools: list[AgentToolDef],
         tool_results: list[ToolResult],
-        chain_fetches: dict[str, set[str]],
+        chain_fetches: dict[str, dict[str, _FetchedContract]],
         risk_budget_usd: float | None,
         data_tool_call_count: int,
         *,
@@ -661,6 +816,16 @@ def _tool_result_payload(tr: ToolResult) -> dict[str, Any]:
     return {"ok": False, "error": tr.error or "unknown error"}
 
 
+def _two_sided_mid(bid: Any, ask: Any) -> str | None:
+    try:
+        b, a = Decimal(str(bid)), Decimal(str(ask))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if b <= 0 or a <= 0:
+        return None
+    return f"{(b + a) / 2:.2f}"
+
+
 def _summarise_tool_result(tr: ToolResult) -> str:
     """One-line summary of a tool result for the event stream. The frontend
     shows this verbatim, so it must be short, human-readable, and never leak
@@ -673,7 +838,11 @@ def _summarise_tool_result(tr: ToolResult) -> str:
         # Hand-pick fields per tool that read well in the stream. Falls back
         # to a generic "N keys" if nothing matches.
         if "last" in data and "symbol" in data:
-            return f"{data['symbol']} = ${data.get('last') or data.get('mid') or '—'}"
+            px = data.get("last") or _two_sided_mid(data.get("bid"), data.get("ask"))
+            if px:
+                return f"{data['symbol']} = ${px}"
+            # Pre-market: no trade yet and a one-sided book.
+            return f"{data['symbol']}: no trade yet (bid {data.get('bid')} / ask {data.get('ask')})"
         if "contracts" in data and isinstance(data["contracts"], list):
             return f"{len(data['contracts'])} contracts"
         if "filings" in data and isinstance(data["filings"], list):
@@ -688,8 +857,30 @@ def _summarise_tool_result(tr: ToolResult) -> str:
     return "ok"
 
 
-def _record_chain_fetch(tr: ToolResult, chain_fetches: dict[str, set[str]]) -> None:
-    """Track which OCC symbols we've fetched, so we can verify the final pick is real."""
+def _to_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class _FetchedContract:
+    """What the fetched chain actually said about one contract — the ground
+    truth the final pick's strike and premium are verified against."""
+
+    strike: Decimal | None
+    bid: Decimal | None
+    ask: Decimal | None
+
+
+def _record_chain_fetch(
+    tr: ToolResult, chain_fetches: dict[str, dict[str, _FetchedContract]]
+) -> None:
+    """Track every contract fetched (occ → strike/bid/ask), so the final pick
+    can be verified against data the model actually saw."""
     data = tr.data
     if not isinstance(data, dict):
         return
@@ -700,7 +891,11 @@ def _record_chain_fetch(tr: ToolResult, chain_fetches: dict[str, set[str]]) -> N
     for c in contracts:
         occ = str(c.get("occ_symbol", "")).upper()
         if occ:
-            chain_fetches.setdefault(symbol, set()).add(occ)
+            chain_fetches.setdefault(symbol, {})[occ] = _FetchedContract(
+                strike=_to_decimal(c.get("strike")),
+                bid=_to_decimal(c.get("bid")),
+                ask=_to_decimal(c.get("ask")),
+            )
 
 
 def _json_safe(obj: Any) -> Any:

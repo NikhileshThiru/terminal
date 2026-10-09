@@ -28,6 +28,10 @@ COPY alembic.ini /app/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
+# Drop root. A home dir is needed: yfinance keeps its tz cache in ~/.cache.
+RUN useradd --create-home --uid 10001 app
+USER app
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

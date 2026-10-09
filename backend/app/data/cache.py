@@ -31,16 +31,33 @@ class _Entry:
 
 
 class InMemoryCache:
-    """Single-process TTL cache.
+    """Single-process TTL cache, bounded.
+
+    Expired entries are swept every `sweep_every` writes, and the cache never
+    holds more than `max_entries` (oldest-written evicted first). Without
+    both, keys that rotate and are never read again — e.g. Alpaca OHLC keys
+    embed the end date, so every symbol mints a fresh key each day — pile up
+    forever in the 24/7 worker.
 
     Constructor accepts a `clock` callable for deterministic testing. In
     production it defaults to `time.monotonic`.
     """
 
-    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        max_entries: int = 10_000,
+        sweep_every: int = 256,
+    ) -> None:
+        if max_entries < 1:
+            raise ValueError(f"max_entries must be >= 1, got {max_entries}")
         self._data: dict[str, _Entry] = {}
         self._lock = asyncio.Lock()
         self._clock = clock
+        self._max_entries = max_entries
+        self._sweep_every = max(1, sweep_every)
+        self._writes = 0
 
     async def get(self, key: str) -> Any | None:
         async with self._lock:
@@ -56,7 +73,19 @@ class InMemoryCache:
         if ttl_seconds <= 0:
             raise ValueError(f"ttl_seconds must be positive, got {ttl_seconds}")
         async with self._lock:
-            self._data[key] = _Entry(value=value, expires_at=self._clock() + ttl_seconds)
+            now = self._clock()
+            # pop + insert moves the key to the end, so dict order == write order.
+            self._data.pop(key, None)
+            self._data[key] = _Entry(value=value, expires_at=now + ttl_seconds)
+            self._writes += 1
+            if self._writes % self._sweep_every == 0 or len(self._data) > self._max_entries:
+                self._purge_expired(now)
+            while len(self._data) > self._max_entries:
+                del self._data[next(iter(self._data))]
+
+    def _purge_expired(self, now: float) -> None:
+        for k in [k for k, e in self._data.items() if e.expires_at <= now]:
+            del self._data[k]
 
     async def delete(self, key: str) -> None:
         async with self._lock:

@@ -89,6 +89,16 @@ export interface TriageDecisionRecord {
 
 export interface WorkerStatus {
   state: 'stopped' | 'starting' | 'running' | 'stopping';
+  /** Topology: in-memory queue vs Redis Streams, and whether ingestion is its own service. */
+  event_bus: 'memory' | 'redis';
+  ingestion_mode: 'embedded' | 'external';
+  ingestion_state: 'embedded' | 'up' | 'down' | 'stopped';
+  news_stream_state: 'connected' | 'reconnecting' | 'auth_failed' | 'stopped' | 'dead' | 'disabled';
+  news_stream_last_error: string | null;
+  /** Visible skips: stale backlog, all triage LLMs out of quota, daily thesis cap. */
+  events_stale: number;
+  events_skipped_quota: number;
+  events_skipped_thesis_cap: number;
   started_at: string | null;
   stopped_at: string | null;
   watchlist: string[];
@@ -284,11 +294,12 @@ export async function getPaperAccounts(): Promise<AccountSummary[]> {
 export async function getShadowTrades(
   account_kind?: string,
   limit = 20,
+  status?: 'open' | 'closed',
 ): Promise<ShadowTradeRow[]> {
-  const qs = account_kind
-    ? `?account_kind=${encodeURIComponent(account_kind)}&limit=${limit}`
-    : `?limit=${limit}`;
-  return _request<ShadowTradeRow[]>(`/portfolio/shadow-trades${qs}`);
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (account_kind) params.set('account_kind', account_kind);
+  if (status) params.set('status', status);
+  return _request<ShadowTradeRow[]>(`/portfolio/shadow-trades?${params.toString()}`);
 }
 
 export interface EquityPoint {
@@ -347,6 +358,34 @@ export async function getEvalSummary(): Promise<EvalSummary> {
   return _request<EvalSummary>('/eval/summary');
 }
 
+// === Shadow -> paper graduation gate (CLAUDE.md §8) ===
+
+export interface GraduationCriterion {
+  key: 'volume' | 'grounding' | 'calibration';
+  label: string;
+  value: number | null;
+  threshold: number;
+  comparator: '>=' | '<=';
+  passed: boolean;
+  detail: string;
+}
+
+export interface Graduation {
+  ready: boolean;
+  criteria: GraduationCriterion[];
+  shadow_theses: number;
+  resolved: number;
+  attempts: number;
+  grounding_rejected: number;
+  hit_rate: number | null;
+  attempts_tracked_since: string | null;
+  notes: string[];
+}
+
+export async function getGraduation(): Promise<Graduation> {
+  return _request<Graduation>('/eval/graduation');
+}
+
 export async function getCalibration(
   bucket: SourceBucket = 'manual',
   n_buckets = 10,
@@ -394,10 +433,57 @@ export interface CostSummary {
   since: string;
   by_model: CostBreakdown[];
   daily_request_budget: number;
+  /** "db" = today (Pacific day, survives restarts); "memory" = since process start. */
+  source: 'db' | 'memory';
 }
 
 export async function getCostSummary(): Promise<CostSummary> {
   return _request<CostSummary>('/llm/cost-summary');
+}
+
+// === LLM route health (quota resilience) ===
+
+export interface LLMRouteHealth {
+  position: number;
+  provider: string;
+  model: string;
+  state: 'ok' | 'cooling';
+  cooldown_until: string | null;
+  calls: number;
+  successes: number;
+  failures: number;
+  rate_limited: number;
+  last_error: string | null;
+  last_success_at: string | null;
+  last_failure_at: string | null;
+}
+
+export interface LLMStepHealth {
+  step: 'triage' | 'thesis';
+  routes: LLMRouteHealth[];
+  status: 'ok' | 'degraded' | 'down' | 'unconfigured';
+}
+
+export interface LLMUsageRow {
+  step: string;
+  provider: string;
+  model: string;
+  calls: number;
+  ok: number;
+  rate_limited: number;
+  input_tokens: number;
+  output_tokens: number;
+  avg_latency_ms: number | null;
+}
+
+export interface LLMHealth {
+  steps: LLMStepHealth[];
+  usage_today: LLMUsageRow[];
+  usage_since: string | null;
+}
+
+export async function getLLMHealth(): Promise<LLMHealth> {
+  return _request<LLMHealth>('/llm/health');
 }
 
 // === Ticker info + news ===

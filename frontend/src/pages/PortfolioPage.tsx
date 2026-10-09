@@ -20,14 +20,22 @@ import { EmptyState } from '../ui/EmptyState';
  */
 export function PortfolioPage() {
   const [accounts, setAccounts] = useState<AccountSummary[]>([]);
-  const [trades, setTrades] = useState<ShadowTradeRow[]>([]);
+  const [openTrades, setOpenTrades] = useState<ShadowTradeRow[]>([]);
+  const [closedTrades, setClosedTrades] = useState<ShadowTradeRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [a, t] = await Promise.all([getPaperAccounts(), getShadowTrades(undefined, 30)]);
+      // Open and closed are fetched separately so the limit can't hide a
+      // long-held open position behind a page of newer closed trades.
+      const [a, open, closed] = await Promise.all([
+        getPaperAccounts(),
+        getShadowTrades(undefined, 200, 'open'),
+        getShadowTrades(undefined, 30, 'closed'),
+      ]);
       setAccounts(a);
-      setTrades(t);
+      setOpenTrades(open);
+      setClosedTrades(closed);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -68,8 +76,8 @@ export function PortfolioPage() {
 
       <EquityCurveChart />
 
-      <OpenPositionsSection trades={trades.filter((t) => t.status === 'shadow_open')} />
-      <TradeHistorySection trades={trades.filter((t) => t.status !== 'shadow_open')} />
+      <OpenPositionsSection trades={openTrades} />
+      <TradeHistorySection trades={closedTrades} />
     </div>
   );
 }

@@ -37,16 +37,51 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # === LLM providers (Phase 4) ===
+    # Cloud: Gemini + Groq (both free-tier). There is NO Anthropic provider by
+    # design: the Anthropic API has no free tier (would break the free rule)
+    # and the owner's Claude subscription must never be consumed by this
+    # project. Local Ollama was considered and cut (multi-GB model download
+    # for a last-resort path the two-cloud fallback already covers).
     gemini_api_key: str | None = None
-    anthropic_api_key: str | None = None
     groq_api_key: str | None = None
-    llm_triage_provider: Literal["gemini", "anthropic", "groq", "ollama"] = "gemini"
-    llm_triage_model: str = "gemini-2.5-flash-lite"
-    llm_thesis_provider: Literal["gemini", "anthropic", "groq", "ollama"] = "gemini"
+    # Primary route per step. Groq's free models are fast and have their own
+    # per-model daily quotas, which keeps triage off Gemini's quota entirely.
+    llm_triage_provider: Literal["gemini", "groq"] = "groq"
+    llm_triage_model: str = "openai/gpt-oss-20b"
+    llm_thesis_provider: Literal["gemini", "groq"] = "gemini"
     llm_thesis_model: str = "gemini-2.5-flash"
-    # Free-tier request budget per day (Gemini Flash free tier ≈ 1,500 req/day,
-    # DESIGN.md §5). The header chip renders calls-vs-budget; the triage gate
-    # plus dedup keep real usage far below this.
+    # Ordered fallbacks ("provider:model", comma-separated in env). Free-tier
+    # quotas are PER MODEL, and Gemini's are small (~20 requests/day/model on
+    # the 2026 free tier, observed), so each extra model is real capacity:
+    # - thesis: seven Gemini models ≈ 7x the daily theses of one (the first
+    #   live morning exhausted three of the original four by 09:40). Gemini 3
+    #   needs thought signatures echoed across tool turns (handled in
+    #   app/llm/gemini.py, including mid-thesis failover between models).
+    #   Groq is absent: its 8K tokens/minute cap is smaller than one
+    #   multi-tool thesis request.
+    # - triage: Groq first (1,000 req/day per model), then a Gemini model the
+    #   thesis chain does NOT use, so triage can never starve theses.
+    llm_triage_fallbacks: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["groq:openai/gpt-oss-120b", "gemini:gemini-3.1-flash-lite"]
+    )
+    llm_thesis_fallbacks: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            "gemini:gemini-3.5-flash",
+            "gemini:gemini-3.7-flash",
+            "gemini:gemini-3.6-flash",
+            "gemini:gemini-3-flash-preview",
+            "gemini:gemini-3.8-flash",  # slowest under load (~90 s/call observed)
+            "gemini:gemini-2.5-flash-lite",  # weakest: last resort
+        ]
+    )
+    # Cooldown after a 429 with no upstream retry hint; doubles per
+    # consecutive 429 up to the max. Daily-quota 429s use the upstream hint
+    # (or midnight Pacific for Gemini) instead.
+    llm_default_cooldown_seconds: float = 60.0
+    llm_max_cooldown_seconds: float = 1800.0
+    # Free-tier request budget per day, rendered as the header's
+    # calls-vs-budget chip (counted from the llm_calls table, Pacific day).
+    # Sum of the routes' daily caps is higher; this is the comfort line.
     llm_daily_request_budget: int = 1500
 
     # === Market data (Phase 2) ===
@@ -120,11 +155,40 @@ class Settings(BaseSettings):
 
     # === Autonomous discovery (Phase 6) ===
     autonomous_risk_budget_usd: float = 500.0
+    # Thesis pacing: each reactive thesis costs ~9 thesis-model calls and the
+    # whole free Gemini chain allows roughly 7 theses/day; on the first live
+    # morning reactive news alone exhausted 5 of 7 models by 10:00 ET. A small
+    # cap keeps quota for the (higher-value) catalyst path. Events that pass triage
+    # after the cap is hit are recorded as skipped, visibly. Catalyst theses
+    # don't count against it.
+    autonomous_max_reactive_theses_per_day: int = 4
     discovery_poll_interval_seconds: float = 300.0
+    # Gate autonomous thesis generation (reactive + catalyst) to the regular
+    # US equity session (CLAUDE.md §7). Off-session events are dropped with a
+    # visible triage decision; catalysts simply wait for the next open-hours
+    # tick. Set false in dev to test with synthetic events at any hour.
+    market_hours_gate: bool = True
     # When true, the FastAPI lifespan starts the worker automatically — the
     # autonomous mode IS the product, so manual toggling shouldn't be a
     # prerequisite for the dashboard to feel alive.
     autonomous_autostart: bool = True
+
+    # === Event bus + ingestion topology (CLAUDE.md §3-4) ===
+    # memory  = asyncio.Queue inside the backend process (tests, plain uvicorn).
+    # redis   = Redis Streams consumer group (the docker-compose stack).
+    event_bus: Literal["memory", "redis"] = "memory"
+    # embedded = the worker runs the EDGAR poller + Alpaca news WS itself.
+    # external = a separate `ingestion` service publishes to the Redis bus and
+    #            reports its health via a Redis key (requires event_bus=redis).
+    ingestion_mode: Literal["embedded", "external"] = "embedded"
+    event_stream_key: str = "terminal:events"
+    # ~2 months of events at ~800/day: the stream doubles as the replay log.
+    event_stream_maxlen: int = 50_000
+    # Reactive staleness gate: an event that sat on the bus longer than this
+    # (worker was down, backlog after restart) is skipped visibly instead of
+    # spending quota on news the market priced in long ago (CLAUDE.md §4:
+    # reactive target is minutes, not hours).
+    reactive_max_event_age_seconds: float = 900.0
 
     # === Reconciliation jobs (Phase 7+, DESIGN.md §8) ===
     mtm_interval_seconds: float = 300.0  # mark-to-market every 5 min
@@ -162,6 +226,15 @@ class Settings(BaseSettings):
         # Allow comma-separated strings from env vars
         if isinstance(v, str):
             return [s.strip().upper() for s in v.split(",") if s.strip()]
+        return v
+
+    @field_validator("llm_triage_fallbacks", "llm_thesis_fallbacks", mode="before")
+    @classmethod
+    def _split_routes(cls, v: object) -> object:
+        # "gemini:gemini-2.5-flash-lite,groq:openai/gpt-oss-120b" -> list.
+        # Model ids keep their case (Groq ids are case-sensitive).
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
         return v
 
     @property

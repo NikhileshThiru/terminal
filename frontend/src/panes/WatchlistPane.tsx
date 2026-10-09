@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 
 import { useNavigation } from '../chrome/NavigationContext';
 import { Pane } from '../chrome/Pane';
@@ -43,7 +43,9 @@ export function WatchlistPane() {
   const [history, setHistory] = useState<HistoryMap>({});
   const [lastTickAt, setLastTickAt] = useState<number | null>(null);
   const [, forceRerender] = useState(0);
-  const esRef = useRef<EventSource | null>(null);
+  // Real connection state (a ref is non-reactive and was never cleared on
+  // error, so the dot used to pulse "live" even while the feed was down).
+  const [live, setLive] = useState(false);
 
   // Pull watchlist symbols once.
   useEffect(() => {
@@ -87,7 +89,7 @@ export function WatchlistPane() {
     if (symbols.length === 0) return;
     const url = `${API_URL}/prices/stream?symbols=${encodeURIComponent(symbols.join(','))}`;
     const es = new EventSource(url);
-    esRef.current = es;
+    es.onopen = () => setLive(true);
 
     es.addEventListener('quote', (e) => {
       try {
@@ -113,6 +115,7 @@ export function WatchlistPane() {
           };
         });
         setLastTickAt(Date.now());
+        setLive(true);
       } catch {
         /* malformed event; skip */
       }
@@ -137,12 +140,13 @@ export function WatchlistPane() {
     });
 
     es.onerror = () => {
-      // EventSource auto-reconnects; nothing to do.
+      // EventSource auto-reconnects; onopen flips this back on recovery.
+      setLive(false);
     };
 
     return () => {
       es.close();
-      esRef.current = null;
+      setLive(false);
     };
   }, [symbols]);
 
@@ -162,7 +166,7 @@ export function WatchlistPane() {
         <span className="text-text-dim flex items-center gap-1.5 text-[10px]">
           <span
             className={`inline-block h-1.5 w-1.5 rounded-full ${
-              esRef.current ? 'bg-accent animate-pulse' : 'bg-text-dim'
+              live ? 'bg-accent animate-pulse' : 'bg-text-dim'
             }`}
           />
           {freshnessLabel}

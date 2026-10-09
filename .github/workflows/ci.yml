@@ -79,3 +79,13 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  images:
+    # "Containerize as you go": every push proves both images still build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image (API, agent worker, ingestion)
+        run: docker build -t terminal-backend backend
+      - name: Build frontend image (production bundle served by nginx)
+        run: docker build -t terminal-frontend --build-arg VITE_API_URL=http://localhost:8000 frontend

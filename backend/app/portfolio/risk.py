@@ -12,6 +12,11 @@ Inputs:
 Output:
 - A RiskDecision: approved/rejected + sizing (possibly < the thesis suggested
   if we needed to cap to budget) + a human-readable reason.
+
+On `min_confidence` (ADR-0003, 2026-10 clarification): the LLM's confidence
+only *filters* which theses an account considers — that filter is the
+conservative-vs-aggressive experiment. It never authorizes risk by itself
+(every cap below still applies) and never scales size.
 """
 
 from __future__ import annotations

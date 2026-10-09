@@ -8,7 +8,6 @@ agent is running, not just per-request manual copilot.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import AsyncIterator
 
@@ -28,29 +27,26 @@ def _sse(evt: CopilotEvent) -> str:
     return f"event: {evt.kind}\ndata: {json.dumps(evt.payload, default=str)}\n\n"
 
 
+KEEPALIVE_SECONDS = 25.0
+
+
 @router.get("/events/stream")
 async def stream_agent_events() -> StreamingResponse:
     """Global SSE stream of every agent event. Subscribe once on app boot;
-    stays open for the life of the client. The server pushes a periodic
-    heartbeat so reverse proxies don't time out the connection during
-    quiet windows."""
+    stays open for the life of the client. After KEEPALIVE_SECONDS with no
+    events the server sends a `tick` so reverse proxies (Cloudflare Tunnel
+    idles out at ~100s) don't drop the connection during quiet windows."""
     broadcaster = get_agent_broadcaster()
 
     async def gen() -> AsyncIterator[str]:
         # Hello so the frontend can render an empty "connected" state
         # immediately, before the first real event lands.
         yield f"event: hello\ndata: {json.dumps({})}\n\n"
-        last_send = asyncio.get_event_loop().time()
-        async for evt in broadcaster.stream():
-            yield _sse(evt)
-            last_send = asyncio.get_event_loop().time()
-            # If we'd been idle for >25s with no events, emit a tick. In
-            # practice the broadcaster will be active, but during quiet
-            # market hours we still want the connection kept alive.
-            now = asyncio.get_event_loop().time()
-            if now - last_send > 25:
+        async for evt in broadcaster.stream(idle_seconds=KEEPALIVE_SECONDS):
+            if evt is None:
                 yield f"event: tick\ndata: {json.dumps({})}\n\n"
-                last_send = now
+            else:
+                yield _sse(evt)
 
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)

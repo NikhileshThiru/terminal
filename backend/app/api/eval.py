@@ -233,3 +233,38 @@ async def eval_outcomes(
         )
         for (o, t) in rows
     ]
+
+
+class CriterionOut(BaseModel):
+    key: str
+    label: str
+    value: float | None
+    threshold: float
+    comparator: str
+    passed: bool
+    detail: str
+
+
+class GraduationOut(BaseModel):
+    ready: bool
+    criteria: list[CriterionOut]
+    shadow_theses: int
+    resolved: int
+    attempts: int
+    grounding_rejected: int
+    hit_rate: float | None
+    attempts_tracked_since: datetime | None
+    notes: list[str]
+
+
+@router.get("/graduation", response_model=GraduationOut)
+async def eval_graduation() -> GraduationOut:
+    """Shadow -> paper go/no-go (CLAUDE.md §8). Reports only; graduating is a
+    human config change."""
+    from dataclasses import asdict
+
+    from app.eval.graduation import graduation_report
+
+    async with get_session_factory()() as session:
+        report = await graduation_report(session)
+    return GraduationOut(**asdict(report))

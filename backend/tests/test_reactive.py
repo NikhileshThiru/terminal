@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -102,6 +103,7 @@ class _StubCopilot:
         *,
         risk_budget_usd: float | None = None,
         source_bucket: str = "manual",
+        **_: Any,
     ) -> CopilotRun:
         self.calls.append((user_thesis, risk_budget_usd, source_bucket))
         if self._error is not None:
@@ -240,3 +242,147 @@ async def test_start_stop_lifecycle() -> None:
     await asyncio.sleep(0.05)
     await runner.stop()
     assert runner.stats.events_consumed >= 1
+
+
+@pytest.mark.asyncio
+async def test_off_session_event_dropped_before_triage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Market-hours gate (CLAUDE.md §7): an off-session event must not reach
+    triage (overnight LLM quota) or the copilot (theses graded against stale
+    quotes), and the drop must be visible as a recorded decision."""
+    from app.discovery import reactive as reactive_mod
+
+    monkeypatch.setattr(reactive_mod, "is_market_open", lambda _now: False)
+    triage_llm = _StubTriageLLM(
+        [TriageDecision(passed=True, reason="would have passed", confidence=0.9)]
+    )
+    copilot = _StubCopilot(error=RuntimeError("copilot must not be called off-session"))
+    runner = ReactiveRunner(
+        bus=InMemoryEventBus(),
+        copilot=copilot,
+        triage_llm=triage_llm,
+        triage_model="m",
+        enforce_market_hours=True,
+    )
+    result = await runner._process_one(_ev(9))
+    assert result is None
+    assert runner.stats.events_off_session == 1
+    assert triage_llm.calls == 0
+    assert copilot.calls == []
+    last = runner.stats.last_triage_decisions[-1]
+    assert last["passed"] is False
+    assert "off-session" in str(last["reason"])
+
+
+@pytest.mark.asyncio
+async def test_quota_exhausted_triage_records_visible_skip() -> None:
+    """All triage routes rate-limited: the event must show up in the News pane
+    as an explicit skip, not vanish (July 2026 incident)."""
+    from app.data.types import ProviderUnavailable, ProviderUnavailableReason
+
+    class _ExhaustedLLM(_StubTriageLLM):
+        async def complete_structured(self, **_: Any) -> Any:
+            raise ProviderUnavailable(
+                reason=ProviderUnavailableReason.RATE_LIMITED,
+                message="all triage LLM routes rate-limited/cooling",
+                provider="router",
+            )
+
+    runner = ReactiveRunner(
+        bus=InMemoryEventBus(),
+        copilot=_StubCopilot(error=RuntimeError("must not be called")),
+        triage_llm=_ExhaustedLLM(),
+        triage_model="m",
+    )
+    assert await runner._process_one(_ev(1)) is None
+    assert runner.stats.triage_failures == 1
+    assert runner.stats.events_skipped_quota == 1
+    decision = runner.stats.last_triage_decisions[-1]
+    assert decision["passed"] is False
+    assert str(decision["reason"]).startswith("skipped:")
+
+
+def _passing_run() -> CopilotRun:
+    return CopilotRun(
+        thesis=_sample_thesis(),
+        tool_results=[],
+        grounding=GroundingResult(
+            passed=True, unverified_numbers=[], tools_used=[], extracted_count=0
+        ),
+        iterations_used=3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_daily_thesis_cap_skips_after_limit_and_counts_from_db() -> None:
+    """Thesis pacing: once today's reactive theses reach the cap, further
+    triage passes are recorded as skipped instead of spending thesis quota.
+    The count comes from the DB so a restart can't reset it."""
+    factory = persistence.get_session_factory()
+    triage_llm = _StubTriageLLM(
+        [TriageDecision(passed=True, reason="material", confidence=0.9) for _ in range(3)]
+    )
+    copilot = _StubCopilot(run=_passing_run())
+    runner = ReactiveRunner(
+        bus=InMemoryEventBus(),
+        copilot=copilot,
+        triage_llm=triage_llm,
+        triage_model="m",
+        session_factory=factory,
+        max_theses_per_day=2,
+    )
+    assert await runner._process_one(_ev(1)) is not None
+    assert await runner._process_one(_ev(2)) is not None
+    assert await runner._process_one(_ev(3)) is None
+    assert len(copilot.calls) == 2
+    assert runner.stats.events_skipped_thesis_cap == 1
+    assert "daily reactive thesis cap (2)" in str(runner.stats.last_triage_decisions[-1]["reason"])
+
+    # A fresh runner (= backend restart) still sees today's two theses.
+    restarted = ReactiveRunner(
+        bus=InMemoryEventBus(),
+        copilot=_StubCopilot(error=RuntimeError("cap must hold across restart")),
+        triage_llm=_StubTriageLLM([TriageDecision(passed=True, reason="material", confidence=0.9)]),
+        triage_model="m",
+        session_factory=factory,
+        max_theses_per_day=2,
+    )
+    assert await restarted._process_one(_ev(4)) is None
+    assert restarted.stats.events_skipped_thesis_cap == 1
+
+
+@pytest.mark.asyncio
+async def test_synthetic_event_is_a_dry_run_never_persisted() -> None:
+    """POST /autonomous/inject events run the funnel (demo) but must never
+    become theses, trades, triage-log rows, or grounding attempts."""
+    from sqlalchemy import func, select
+
+    from app.discovery.models import TriageDecisionRow
+    from app.eval.models import Thesis as ThesisRow
+
+    factory = persistence.get_session_factory()
+    calls: list[dict[str, Any]] = []
+
+    class _RecordingCopilot(_StubCopilot):
+        async def generate(self, user_thesis: str, **kwargs: Any) -> CopilotRun:
+            calls.append(kwargs)
+            return _passing_run()
+
+    runner = ReactiveRunner(
+        bus=InMemoryEventBus(),
+        copilot=_RecordingCopilot(),
+        triage_llm=_StubTriageLLM([TriageDecision(passed=True, reason="material", confidence=0.9)]),
+        triage_model="m",
+        session_factory=factory,
+    )
+    event = _ev(9).model_copy(update={"payload": {"synthetic": True}})
+    run = await runner._process_one(event)
+    assert run is not None  # the demo still sees the thesis
+    assert calls[0]["record_attempt"] is False
+    assert runner.stats.synthetic_dry_runs == 1
+    assert runner.stats.theses_produced == 0
+    await asyncio.gather(*list(runner._persist_tasks))
+    async with factory() as session:
+        assert (await session.execute(select(func.count(ThesisRow.id)))).scalar_one() == 0
+        assert (await session.execute(select(func.count(TriageDecisionRow.id)))).scalar_one() == 0

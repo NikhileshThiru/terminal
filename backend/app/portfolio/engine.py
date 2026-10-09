@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agent.schemas import Thesis
 from app.core.logging import get_logger
+from app.core.market_hours import eastern_day_start
 from app.portfolio.models import (
     PaperAccount,
     ShadowTrade,
@@ -143,7 +144,8 @@ class PaperEngine:
 
     @staticmethod
     async def _load_state(session: AsyncSession, account_id: int) -> AccountState:
-        today_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        # Trading-day boundary (ET midnight), not UTC midnight (8pm ET).
+        today_start = eastern_day_start(datetime.now(UTC))
         trades_today = await session.scalar(
             select(func.count(ShadowTrade.id))
             .where(ShadowTrade.account_id == account_id)

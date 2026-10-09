@@ -35,6 +35,11 @@ class DiscoveryEvent(BaseModel):
     # Source-specific raw payload for downstream debugging / re-processing.
     payload: dict[str, Any] = Field(default_factory=dict)
 
+    # When the event entered the bus (set by EventBus.publish). The reactive
+    # staleness gate measures from here: `published_at` is the source's own
+    # timestamp (date-only for EDGAR), not when we could have acted on it.
+    ingested_at: datetime | None = None
+
     def short_summary(self) -> str:
         """A compact one-line description for logs."""
         syms = ",".join(self.symbols[:3]) if self.symbols else "—"

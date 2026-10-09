@@ -13,6 +13,7 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+frontend/coverage/
 *.egg-info/
 dist/
 build/
@@ -48,6 +49,8 @@ docker-compose.override.yml
 *.db-wal
 *.db-shm
 backend/terminal.db
+*.bak-*
+.fuse_hidden*
 
 # docs/screenshots/ is committed on purpose — the README renders from it on
 # GitHub. Keep it curated: downscale to ≤1280px, delete superseded captures.

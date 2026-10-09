@@ -126,12 +126,28 @@ export function AutonomousPage() {
 
 function StatusGrid({ status }: { status: WorkerStatus }) {
   const failures = status.triage_failures + status.thesis_failures + status.persistence_failures;
+  const skipped =
+    status.events_stale + status.events_skipped_quota + status.events_skipped_thesis_cap;
+  const ingestionOk = status.ingestion_state === 'up' || status.ingestion_state === 'embedded';
+  const newsOk = status.news_stream_state === 'connected';
   return (
-    <div className="grid shrink-0 grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
+    <div className="grid shrink-0 grid-cols-2 gap-2 sm:grid-cols-5">
       <StatCell
         label="state"
         value={status.state}
         tone={status.state === 'running' ? 'accent' : 'default'}
+      />
+      <StatCell
+        label="ingestion"
+        value={status.ingestion_state}
+        tone={ingestionOk ? 'accent' : 'error'}
+        hint={`${status.ingestion_mode} ingestion · ${status.event_bus === 'redis' ? 'Redis Streams' : 'in-memory'} bus`}
+      />
+      <StatCell
+        label="news ws"
+        value={status.news_stream_state}
+        tone={newsOk ? 'accent' : 'error'}
+        hint={status.news_stream_last_error ?? 'Alpaca news websocket (Benzinga, all symbols)'}
       />
       <StatCell label="events" value={status.events_consumed.toLocaleString()} />
       <StatCell label="triaged" value={status.events_passed_triage.toLocaleString()} />
@@ -140,7 +156,11 @@ function StatusGrid({ status }: { status: WorkerStatus }) {
         value={status.theses_produced.toLocaleString()}
         tone={status.theses_produced > 0 ? 'accent' : 'default'}
       />
-      <StatCell label="polls" value={status.polls_completed.toLocaleString()} />
+      <StatCell
+        label="skipped"
+        value={skipped.toLocaleString()}
+        hint={`stale ${status.events_stale} · quota ${status.events_skipped_quota} · daily cap ${status.events_skipped_thesis_cap}`}
+      />
       <StatCell
         label="failures"
         value={failures}
@@ -150,8 +170,8 @@ function StatusGrid({ status }: { status: WorkerStatus }) {
       <StatCell label="last poll" value={fmtHMS(status.last_poll_at)} />
       <StatCell
         label="models"
-        value={`${status.triage_model.split('-')[0]} / ${status.thesis_model}`}
-        hint={`triage: ${status.triage_provider}/${status.triage_model} · thesis: ${status.thesis_provider}/${status.thesis_model}`}
+        value={`${shortModel(status.triage_model)} / ${shortModel(status.thesis_model)}`}
+        hint={`triage: ${status.triage_provider}/${status.triage_model} · thesis: ${status.thesis_provider}/${status.thesis_model} · fallbacks in the header's llm chip`}
       />
       {status.last_error && (
         <div className="col-span-full">
@@ -160,6 +180,11 @@ function StatusGrid({ status }: { status: WorkerStatus }) {
       )}
     </div>
   );
+}
+
+/** "openai/gpt-oss-20b" -> "gpt-oss-20b"; "gemini-2.5-flash" unchanged. */
+function shortModel(model: string): string {
+  return model.split('/').pop() ?? model;
 }
 
 function ReactiveThesesCard({

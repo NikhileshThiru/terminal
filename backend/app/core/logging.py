@@ -28,6 +28,14 @@ def configure_logging() -> None:
     level = getattr(logging, settings.log_level)
 
     logging.basicConfig(format="%(message)s", stream=sys.stdout, level=level)
+    # httpx/httpcore log every request URL at INFO. Several free-tier APIs
+    # authenticate in the URL (Discord webhook tokens are the URL path), so
+    # INFO-level request logs are a secret leak. Warnings and errors still
+    # surface; our own provider logs carry the useful context without URLs.
+    # google_genai logs "AFC is enabled" at INFO on every call (we never pass
+    # Python callables, so automatic function calling is irrelevant here).
+    for noisy in ("httpx", "httpcore", "google_genai"):
+        logging.getLogger(noisy).setLevel(max(level, logging.WARNING))
 
     processors: list[Any] = [
         structlog.contextvars.merge_contextvars,

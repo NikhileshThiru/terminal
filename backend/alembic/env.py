@@ -25,6 +25,9 @@ from app.discovery import (
     models as _discovery_models,  # noqa: F401 — register tables with Base.metadata
 )
 from app.eval.models import Base
+from app.llm import (
+    usage_log as _llm_usage_models,  # noqa: F401 — register llm_calls with Base.metadata
+)
 from app.portfolio import (
     models as _portfolio_models,  # noqa: F401 — register tables with Base.metadata
 )

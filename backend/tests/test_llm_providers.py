@@ -2,10 +2,6 @@
 
 GeminiProvider: real implementation, tested with the SDK's async client
 patched at module level so no network is touched.
-
-AnthropicProvider: still a stub (intentionally — DESIGN.md §3, free-forever
-rule). Tested to confirm it satisfies the LLMProvider Protocol and fails in
-the typed way.
 """
 
 from __future__ import annotations
@@ -16,7 +12,6 @@ from typing import Any
 import pytest
 
 from app.data.types import ProviderUnavailable, ProviderUnavailableReason
-from app.llm.anthropic_stub import AnthropicProvider
 from app.llm.gemini import GeminiProvider
 from app.llm.interface import AgentMessage, AgentToolCall, AgentToolDef, LLMMessage, LLMProvider
 
@@ -28,26 +23,10 @@ def test_gemini_satisfies_interface() -> None:
     assert isinstance(p, LLMProvider)
 
 
-def test_anthropic_stub_satisfies_interface() -> None:
-    assert isinstance(AnthropicProvider(), LLMProvider)
-
-
 def test_gemini_rejects_missing_key() -> None:
     with pytest.raises(ProviderUnavailable) as exc:
         GeminiProvider(api_key="")
     assert exc.value.reason == ProviderUnavailableReason.AUTH_MISSING
-
-
-# === Anthropic stub continues to fail in typed way ===
-
-
-@pytest.mark.asyncio
-async def test_anthropic_stub_raises_typed_unavailable() -> None:
-    with pytest.raises(ProviderUnavailable):
-        await AnthropicProvider().complete(
-            messages=[LLMMessage(role="user", content="hi")],
-            model="claude-haiku-4-5",
-        )
 
 
 # === GeminiProvider with a fake SDK client ===

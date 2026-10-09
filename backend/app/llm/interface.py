@@ -1,8 +1,9 @@
 """LLM provider Protocol — provider-agnostic tool-calling (DESIGN.md §3).
 
 The agent loop in app/agent/copilot.py speaks ONLY in the types below; the
-concrete provider (Gemini, Groq, Ollama-local) translates to/from its
-native shape. That's how the model-agnostic-by-config promise actually works.
+concrete provider (Gemini, Groq) translates to/from its native shape, and
+the LLMRouter (app/llm/router.py) composes several of them behind this same
+Protocol. That's how the model-agnostic-by-config promise actually works.
 
 Tool definitions cross the wire as plain JSON-schema dicts — the lowest
 common denominator that both Gemini and OpenAI-compatible APIs accept.
@@ -26,6 +27,11 @@ class AgentToolCall(BaseModel):
     id: str  # provider-assigned call id; opaque to us
     name: str
     arguments: dict[str, Any]
+    # Opaque continuity token some providers require echoed back on the next
+    # turn (Gemini 3 "thought_signature", base64). Tagged with the model that
+    # issued it: a signature is only valid for that model.
+    signature: str | None = None
+    signature_model: str | None = None
 
 
 class AgentToolResult(BaseModel):
@@ -60,6 +66,11 @@ class AgentTurn(BaseModel):
     tool_calls: list[AgentToolCall] = []
     finish_reason: str | None = None
     usage: LLMUsage
+    # Which provider/model actually served this turn. Set by the providers;
+    # matters once the router can fail over mid-conversation — the thesis
+    # records who really wrote it, not who was configured first.
+    provider: str | None = None
+    model: str | None = None
 
 
 class LLMMessage(BaseModel):
@@ -87,7 +98,7 @@ AgentTurn.model_rebuild()
 class LLMProvider(Protocol):
     """The pluggable LLM backend. Manual + autonomous funnels speak only this."""
 
-    name: str  # "gemini" | "groq" | "anthropic" | "ollama"
+    name: str  # "gemini" | "groq" | "router"
 
     async def complete(
         self,

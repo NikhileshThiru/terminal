@@ -30,6 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.logging import get_logger
+from app.core.market_hours import eastern_today
 from app.data.finnhub import FinnhubProvider
 from app.data.types import EarningsEvent, ProviderUnavailable
 from app.data.upsert import dialect_insert
@@ -78,7 +79,7 @@ class CalendarFetcher:
 
     async def run_once(self) -> FetchResult:
         """One tick: refresh the earnings calendar for every symbol in the universe."""
-        from_date = date.today()
+        from_date = eastern_today()
         to_date = from_date + timedelta(days=self._horizon_days)
 
         upserted = skipped = errors = 0
@@ -187,7 +188,7 @@ class CalendarFetcher:
     # Convenience for tests / API.
     async def upcoming(self, *, within_days: int = 14, limit: int = 50) -> list[CatalystEvent]:
         """Read-side query — scheduled events within the window."""
-        today = date.today()
+        today = eastern_today()
         end = today + timedelta(days=within_days)
         async with self._session_factory() as session:
             rows = (

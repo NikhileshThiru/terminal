@@ -101,3 +101,21 @@ class ThesisOutcome(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     thesis: Mapped[Thesis] = relationship(back_populates="outcome")
+
+
+class ThesisAttempt(Base):
+    """Every thesis attempt, including the ones that never became a `theses`
+    row. The grounding pass rate in the shadow-graduation gate (CLAUDE.md §8)
+    is grounded / (grounded + grounding_rejected) over these rows."""
+
+    __tablename__ = "thesis_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    source_bucket: Mapped[str] = mapped_column(String(16), index=True)
+    outcome: Mapped[str] = mapped_column(String(24))  # grounded | grounding_rejected | failed
+    correlation_id: Mapped[str] = mapped_column(String(32))
+    latency_ms: Mapped[int] = mapped_column(Integer)
+    llm_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    llm_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)

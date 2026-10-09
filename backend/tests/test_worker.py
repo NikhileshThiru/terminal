@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import Any
 
 import pytest
 
+from app.discovery.reactive import ReactiveStats
 from app.discovery.worker import AutonomousWorker, WorkerState
 
 
@@ -23,19 +24,7 @@ class _NoopPoller:
 
 
 class _NoopRunner:
-    class _Stats:
-        events_consumed = 0
-        events_passed_triage = 0
-        theses_produced = 0
-        triage_failures = 0
-        thesis_failures = 0
-        persistence_failures = 0
-        last_event_at = None
-        last_thesis_at = None
-        last_error = None
-        last_triage_decisions: ClassVar[list[dict[str, Any]]] = []
-
-    stats = _Stats()
+    stats = ReactiveStats()
 
     def __init__(self, *_: Any, **__: Any) -> None: ...
 
@@ -88,6 +77,8 @@ class _NoopNewsStream:
     events_published = 0
     duplicates_dropped = 0
     last_message_at = None
+    state = "connected"
+    last_error = None
 
     def __init__(self, *_: Any, **__: Any) -> None: ...
 
@@ -113,15 +104,14 @@ class _NoopCatalystJobs:
 @pytest.fixture(autouse=True)
 def _stub_components(monkeypatch: pytest.MonkeyPatch):
     """Swap out the real provider/copilot/poller/runner factories with no-ops."""
-    monkeypatch.setattr("app.discovery.worker.EdgarPoller", _NoopPoller)
+    monkeypatch.setattr("app.discovery.ingest.EdgarPoller", _NoopPoller)
     monkeypatch.setattr("app.discovery.worker.ReactiveRunner", _NoopRunner)
-    monkeypatch.setattr("app.discovery.worker.EdgarFilingsProvider", lambda *_, **__: _NoopEdgar())
-    monkeypatch.setattr("app.discovery.worker._build_triage_llm", lambda _: _NoopLLM())
+    monkeypatch.setattr("app.discovery.worker.get_router", lambda _: _NoopLLM())
     monkeypatch.setattr("app.discovery.worker.build_copilot", lambda: _NoopCopilot())
     monkeypatch.setattr("app.discovery.worker.ReconciliationJobs", _NoopReconciliation)
     monkeypatch.setattr("app.discovery.worker.get_mtm_service", lambda: None)
     monkeypatch.setattr("app.discovery.worker.get_outcome_resolver", lambda: None)
-    monkeypatch.setattr("app.discovery.worker.AlpacaNewsStream", _NoopNewsStream)
+    monkeypatch.setattr("app.discovery.ingest.AlpacaNewsStream", _NoopNewsStream)
     monkeypatch.setattr("app.discovery.worker.CatalystJobs", _NoopCatalystJobs)
     # FinnhubProvider() pulls FINNHUB_API_KEY; stub it to a no-op so the
     # catalyst block doesn't fail in tests that don't care about it.
@@ -170,8 +160,8 @@ async def test_status_includes_config_and_stats() -> None:
     w = AutonomousWorker()
     s = w.status()
     assert s.state == WorkerState.STOPPED
-    assert s.triage_provider in ("gemini", "groq", "anthropic", "ollama")
-    assert s.thesis_provider in ("gemini", "groq", "anthropic", "ollama")
+    assert s.triage_provider in ("gemini", "groq")
+    assert s.thesis_provider in ("gemini", "groq")
     assert isinstance(s.watchlist, list)
     assert s.theses_produced == 0
 

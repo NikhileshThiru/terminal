@@ -47,22 +47,23 @@ services + native backend.
 
 ## The stack at a glance
 
-Four services, defined in `docker-compose.yml`:
+Five services, defined in `docker-compose.yml`. Three of them are the
+application's logical processes (CLAUDE.md §4), which meet only at Postgres
+and Redis:
 
-| Service | Image / build | Port | Durable volume | Restart policy |
+| Service | Image / build | Port | Durable volume | Role |
 |---|---|---|---|---|
-| `backend` | `./backend` (FastAPI + agent worker) | 8000 | — (state in Postgres) | `unless-stopped` |
-| `frontend` | `./frontend` (Vite dev server) | 5173 | — | `unless-stopped` |
-| `postgres` | `postgres:16-alpine` | 5432 | `postgres_data` | `unless-stopped` |
-| `redis` | `redis:7-alpine` | 6379 | `redis_data` | `unless-stopped` |
+| `ingestion` | `./backend`, `python -m app.discovery.ingest` | — | — | Always-on producer: Alpaca news websocket + EDGAR poller → Redis Streams |
+| `backend` | `./backend` (FastAPI + agent worker) | 8000 | — (state in Postgres) | Consumes the stream (triage → thesis → risk → paper engine), reconciliation jobs, catalyst scheduler, API + SSE |
+| `frontend` | `./frontend` (static build served by nginx) | 5173 | — | The terminal UI |
+| `postgres` | `postgres:16-alpine` | 5432 (loopback only) | `postgres_data` | Theses, outcomes, trades, triage log, `llm_calls`, `thesis_attempts` |
+| `redis` | `redis:7-alpine` | 6379 (loopback only) | `redis_data` | `terminal:events` stream (the bus + replay log) and the ingestion heartbeat |
 
-**The agent worker is not a separate container.** The ingestion poller, Alpaca
-news stream, reactive runner, reconciliation jobs, and catalyst scheduler all
-run as in-process `asyncio` tasks inside the `backend` container's uvicorn
-process (started in the FastAPI lifespan; `autonomous_autostart = True`). They
-live and die with the `backend` container, so `restart: unless-stopped` on
-`backend` covers all of them, and they **auto-resume on every boot** — no manual
-toggle needed after a restart.
+All five use `restart: unless-stopped`. The agent worker's jobs (reactive
+runner, reconciliation, catalyst scheduler) are in-process `asyncio` tasks
+inside `backend` and auto-resume on every boot (`autonomous_autostart = True`).
+The `ingestion` container has no HTTP port; its healthcheck passes while its
+heartbeat key (`terminal:ingest:status`, 45 s TTL) is fresh in Redis.
 
 ---
 
@@ -106,23 +107,19 @@ docker compose down               # remove containers + network, KEEP volumes (d
 
 ## First-time setup (fresh machine or fresh volume)
 
-Migrations do **not** run automatically (the backend `CMD` is uvicorn only). On
-a brand-new `postgres_data` volume the schema doesn't exist yet, so the startup
-account-seed would fail. Bring up the datastores, migrate, then start the app:
-
 ```bash
-docker compose up -d postgres redis          # 1. datastores (wait for healthy)
-docker compose ps                            # 2. confirm postgres/redis = healthy
-docker compose run --rm backend alembic upgrade head   # 3. create schema (6 migrations)
-docker compose up -d backend frontend        # 4. start app; worker autostarts
+cp .env.example .env          # then fill in the free API keys
+docker compose up -d --build  # that's it
 ```
 
-Then open <http://localhost:5173>.
+The backend runs `alembic upgrade head` before starting uvicorn (idempotent),
+so a brand-new `postgres_data` volume gets its schema automatically, and the
+`ingestion` service waits for the backend to be healthy (i.e. migrated)
+before it starts writing dedup rows. Then open <http://localhost:5173>.
 
-> On the **existing** Mac volume the schema + data are already present (the
-> backend has been running locally against this same `postgres_data` volume), so
-> you can skip straight to `docker compose up -d --build`. Only re-run
-> `alembic upgrade head` after a `git pull` that adds a new migration.
+> The frontend is a static bundle with the API address baked in at build time
+> (`VITE_API_URL`, a build arg in `docker-compose.yml`). If you change the
+> published API port, rebuild the frontend: `docker compose build frontend`.
 
 ---
 
@@ -143,11 +140,14 @@ docker compose restart               # whole stack
 docker compose restart backend       # one service — worker auto-resumes on boot
 ```
 
-A `restart` preserves all data (it does not touch volumes). The in-flight event
-queue is in-memory and is dropped on restart — that is expected and graceful:
-the EDGAR poller tracks already-seen filings in the `seen_discovery_events`
-table and re-discovers on the next poll, and every triage decision is persisted,
-so the News pane survives the restart. See "What survives a restart" below.
+A `restart` preserves all data (it does not touch volumes). Events live in the
+Redis stream, and the worker ACKs each one only after processing it, so an
+event the backend was mid-way through when it restarted is re-delivered on
+boot. Restarting `backend` doesn't touch the news websocket (it lives in
+`ingestion`). Events that sat on the bus longer than
+`reactive_max_event_age_seconds` (15 min) while the worker was down are skipped
+as *stale* with a visible triage decision, not triaged — see "What survives a
+restart" below.
 
 ### Logs
 
@@ -165,18 +165,18 @@ does **not** stop the containers.
 ```bash
 docker compose ps                                  # container state + health column
 curl -s localhost:8000/health | jq                 # backend liveness
-curl -s localhost:8000/autonomous/status | jq '{state, polls_completed, theses_produced, news_stream_connected}'
+curl -s localhost:8000/autonomous/status | jq '{state, ingestion_state, news_stream_state, events_consumed, theses_produced, last_error}'
+curl -s localhost:8000/llm/health | jq '.steps[] | {step, status, routes: [.routes[] | "\(.provider):\(.model) \(.state)"]}'
 ```
 
-After any restart, confirm the worker came back by checking
-`/autonomous/status` shows `"state": "running"` and the counters are ticking.
+After any restart, confirm `/autonomous/status` shows `"state": "running"`,
+`"ingestion_state": "up"` and `"news_stream_state": "connected"`.
 
 ### Updating after a `git pull`
 
 ```bash
 git pull
-docker compose run --rm backend alembic upgrade head   # only if new migrations landed
-docker compose up -d --build                           # rebuild changed images, recreate
+docker compose up -d --build    # rebuild changed images; migrations apply on backend start
 ```
 
 ---
@@ -204,16 +204,9 @@ restarts (e.g. after a Mac reboot), Docker brings the container back
 
 | State | Where it lives | Survives `restart` / `down`? | Survives `down -v`? |
 |---|---|---|---|
-| Eval outcomes, theses, paper trades, accounts, triage decisions, catalysts | Postgres (`postgres_data` volume) | ✅ yes | ❌ **deleted** |
-| Redis data | `redis_data` volume | ✅ yes (but unused today — see note) | ❌ deleted (harmless) |
-| In-flight event-bus queue | in-memory (`InMemoryEventBus`) | ❌ dropped — re-discovered next poll | ❌ |
-| Funnel counters in the dashboard strip | process memory | ❌ reset to 0 (cosmetic, documented) | ❌ |
-
-> **Redis note:** `redis>=5.1` is a declared dependency and the service is
-> provisioned, but **no app code uses Redis yet** — the event bus is currently
-> `InMemoryEventBus`. The `redis` service is reserved for the future Redis
-> Streams swap (`CLAUDE.md` §3 trigger). Losing Redis data on restart is
-> harmless today.
+| Eval outcomes, theses, attempts, paper trades, accounts, triage decisions, catalysts, `llm_calls` | Postgres (`postgres_data` volume) | ✅ yes | ❌ **deleted** |
+| Event bus + replay log (`terminal:events`, ~2 months retained) | Redis (`redis_data` volume) | ✅ yes; un-ACKed events re-delivered | ❌ deleted (events lost; eval data unaffected) |
+| LLM route cooldowns, funnel counters in the status strip | process memory | ❌ reset (cooldowns re-learn on the next 429) | ❌ |
 
 **Backups (Phase B).** The eval data is the one thing that can't be regenerated.
 On the home server, set up a nightly `pg_dump` to cloud storage (Backblaze B2
@@ -241,10 +234,8 @@ Done as part of the Phase A "continuous running" task.
   skipped only when `environment == "test"`).
 - ✅ Durable state is entirely in Postgres on a named volume; a `restart`/`down`
   preserves it. Only `down -v` destroys it (warned above).
-- ⚠️ Migrations are manual (no entrypoint runs `alembic upgrade head`). Fine for
-  `restart` on an existing volume; required step on a fresh volume and after a
-  `git pull` that adds migrations. *Candidate improvement: an entrypoint that
-  runs `alembic upgrade head` before uvicorn would make upgrades self-healing.*
+- ✅ ~~Migrations are manual~~ — fixed 2026-10: the backend command runs
+  `alembic upgrade head` before uvicorn, so upgrades are self-healing.
 
 **Live verification (ran on the dockerized stack with the real eval data):**
 
@@ -269,3 +260,52 @@ Done as part of the Phase A "continuous running" task.
 | Backend crashes on boot with "relation does not exist" | fresh volume, no schema | `docker compose run --rm backend alembic upgrade head` |
 | `/autonomous/status` shows `stopped` after restart | autostart disabled or startup error | check `docker compose logs backend` for `autonomous_worker_autostart_failed` |
 | `uv run` fails locally with "No such file or directory" | stale venv shebangs after a repo move | `rm -rf backend/.venv && cd backend && uv sync` (this is a local-dev issue, not a container one) |
+| `ingestion_state: "down"` | ingestion container stopped/crashing | `docker compose logs --tail=100 ingestion`; `docker compose up -d ingestion` |
+| `news_stream_state: "auth_failed"` | Alpaca key/secret wrong or revoked | fix `.env`, `docker compose up -d ingestion` (the stream retries every max-backoff interval meanwhile) |
+| News stream logs `406 connection limit exceeded` | old session still holds Alpaca's single free slot (right after a restart) | nothing — it backs off and reconnects on its own |
+| Triage feed shows `skipped: all triage LLM routes rate-limited` | every free quota in the chain is parked | expected under heavy news; `/llm/health` shows each route's `cooldown_until`. Daily Gemini quotas reset at midnight Pacific |
+| Triage feed shows `skipped: stale` | the worker came back to a backlog, or one slow thesis (minutes of failover across overloaded models) held the single consumer while news queued | expected — reactive news older than 15 min isn't worth a thesis. Known limit: the worker processes events one at a time, so thesis latency directly delays triage of the next events |
+| UI calls the wrong API port | `VITE_API_URL` is baked at build time | change the build arg, `docker compose build frontend && docker compose up -d frontend` |
+
+---
+
+## Operator tools
+
+```bash
+# Replay: re-run triage over the stored event log; report agreement with the
+# original decisions (read-only; LLM calls are logged as step=replay).
+docker compose exec backend python -m app.discovery.replay --limit 80 --balanced
+docker compose exec backend python -m app.discovery.replay --source redis --since 2026-10-09
+
+# One-time re-grade of outcomes written by the pre-2026-10 trade-close method
+# (idempotent; previous values kept in thesis_outcomes.notes). Back up first.
+docker compose exec postgres pg_dump -U terminal terminal > backup-$(date +%F).sql
+docker compose exec backend python -m app.portfolio.regrade
+
+# Push a synthetic event through the full funnel (a dry run: never persisted,
+# traded or scored)
+curl -s -X POST localhost:8000/autonomous/inject -H 'content-type: application/json' \
+  -d '{"symbol":"NVDA","headline":"NVIDIA beats Q3 estimates, raises guidance"}'
+```
+
+### MCP server (query Terminal from an MCP client)
+
+Read-only: seven tools over the REST API, no database credentials needed.
+For Claude Desktop, add to `claude_desktop_config.json`
+(`~/Library/Application Support/Claude/` on macOS), adjusting the path and port:
+
+```json
+{
+  "mcpServers": {
+    "terminal": {
+      "command": "uv",
+      "args": ["--directory", "/path/to/Terminal/backend", "run", "python", "-m", "app.mcp_server"],
+      "env": { "TERMINAL_API_URL": "http://localhost:8000" }
+    }
+  }
+}
+```
+
+Tools: `terminal_status`, `list_theses`, `eval_scorecard`, `calibration`,
+`portfolio`, `recent_news`, `upcoming_catalysts`. The client reads *from*
+Terminal; Terminal itself never calls an Anthropic API.

@@ -30,7 +30,9 @@ always-on producers.
 ## Decision
 
 Three logical processes that **never call each other directly**. They meet only
-at the database (PostgreSQL) and the in-memory event bus (Redis Streams).
+at the database (PostgreSQL) and the event bus (Redis Streams in the deployed
+stack; an in-memory queue behind the same Protocol for tests and single-process
+dev runs — see [[ADR-0007]]).
 
 ```
 Producers (always-on)              Consumer (request-driven)

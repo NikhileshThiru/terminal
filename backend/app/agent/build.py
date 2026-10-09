@@ -1,10 +1,10 @@
 """Wire providers + tool registry + LLM into a fully-formed Copilot.
 
-The thesis-step LLM is selected by `LLM_THESIS_PROVIDER` in config — Gemini
-(default; 1M TPM is roomy enough for our multi-tool conversations) or Groq
-(wired and tested but TPM-tight for thesis, fine as a fallback). Both speak
-the LLMProvider Protocol. Providers may raise `ProviderUnavailable(AUTH_MISSING)`
-if a key isn't set in the environment; the endpoint catches that.
+The thesis-step LLM is the config-driven thesis router (app/llm/factory.py):
+Gemini 2.5 Flash first, then other Gemini models (each a separate free daily
+quota) when one is rate-limited or out of quota. Routes may be skipped if a
+key isn't set; with no usable route the router build raises
+`ProviderUnavailable(AUTH_MISSING)`, which the endpoint catches.
 """
 
 from __future__ import annotations
@@ -16,28 +16,9 @@ from app.agent.tools import ToolRegistry
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.data.registry import get_alpaca, get_edgar, get_finnhub
-from app.data.types import ProviderUnavailable, ProviderUnavailableReason
-from app.llm.gemini import GeminiProvider
-from app.llm.groq import GroqProvider
-from app.llm.interface import LLMProvider
+from app.llm.factory import get_router
 
 _log = get_logger(__name__)
-
-
-def _build_llm(provider_name: str) -> LLMProvider:
-    if provider_name == "groq":
-        return GroqProvider()
-    if provider_name == "gemini":
-        return GeminiProvider()
-    raise ProviderUnavailable(
-        reason=ProviderUnavailableReason.NOT_IMPLEMENTED,
-        message=(
-            f"LLM provider {provider_name!r} is configured but not wired. "
-            "Supported: 'gemini', 'groq'."
-        ),
-        provider=provider_name,
-        retryable=False,
-    )
 
 
 @lru_cache(maxsize=1)
@@ -49,18 +30,18 @@ def build_copilot() -> Copilot:
     - filings          : SEC EDGAR
     - analyst/earnings : Finnhub
 
-    LLM for the thesis step is config-driven (LLM_THESIS_PROVIDER + LLM_THESIS_MODEL).
+    LLM for the thesis step is the thesis router (LLM_THESIS_PROVIDER/MODEL
+    + LLM_THESIS_FALLBACKS).
     """
     settings = get_settings()
     alpaca = get_alpaca()
     edgar = get_edgar()
     finnhub = get_finnhub()
 
-    llm = _build_llm(settings.llm_thesis_provider)
+    llm = get_router("thesis")
     _log.info(
         "copilot_built",
-        thesis_provider=settings.llm_thesis_provider,
-        thesis_model=settings.llm_thesis_model,
+        thesis_routes=[r.label for r in llm.routes],
     )
 
     registry = ToolRegistry(
@@ -69,4 +50,11 @@ def build_copilot() -> Copilot:
         filings_provider=edgar,
         finnhub=finnhub,
     )
-    return Copilot(llm=llm, registry=registry, model=settings.llm_thesis_model)
+    from app.eval.persistence import record_attempt
+
+    return Copilot(
+        llm=llm,
+        registry=registry,
+        model=settings.llm_thesis_model,
+        attempt_sink=record_attempt,
+    )

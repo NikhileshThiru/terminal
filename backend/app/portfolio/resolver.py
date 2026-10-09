@@ -1,34 +1,46 @@
-"""Outcome resolver — closes shadow trades and writes ThesisOutcome rows.
+"""Outcome resolver — closes shadow trades, and grades theses.
 
-This is the "did the thesis turn out right?" half of the eval loop. The
-resolver walks every open shadow trade, decides if it should close, computes
-the directional outcome of the underlying, and writes the row that the
-scoring functions in `app/eval/scoring.py` aggregate over.
+Two jobs, deliberately independent:
 
-Two concerns kept separate:
-1. Trade close — fills `shadow_trades.closed_at + close_reason + realized_pnl`.
-   The realized P&L is for the equity-curve story, not the eval.
-2. Thesis outcome — fills `thesis_outcomes.realized_direction + hit + pct_move`.
-   This is for the calibration plot. It scores the UNDERLYING'S direction
-   against the thesis's stated direction, independently of options P&L.
-   (A long call can lose money even if the underlying moved up — theta,
-   IV crush. Scoring the option's P&L would punish the thesis for the
-   trade structure, not the prediction.)
+1. **Close trades** (the P&L story). Walk open shadow trades; close on
+   expiration (4pm ET, settled at the expiration-day close), the thesis's
+   stop-loss, or its theta exit. Fills `closed_at / close_reason /
+   realized_pnl`.
+
+2. **Grade theses** (the eval — what the calibration plot is made of). Every
+   thesis — traded or not — is graded once its own prediction window has
+   ended: the underlying's move from its price *when the thesis was written*
+   to the close on the window's last day, against the stated direction.
+
+Why they must be separate (found 2026-10, see README "What I learned"): the
+original resolver graded a thesis at the moment its trade closed. Most trades
+closed on a stop-loss — and a stop-loss fires *because* the price moved
+against the position — so the grade was sampled at the worst moment, usually
+the same afternoon, and never at the horizon the thesis actually claimed.
+Theses that no account traded were never graded at all. Both are selection
+bias; the old outcomes are re-graded by `regrade_legacy_outcomes()`
+(`python -m app.portfolio.regrade`), keeping their old values in `notes`.
+
+Scoring the underlying rather than the option's P&L is intentional: a long
+call can lose money while the stock goes up (theta, IV crush), and that's
+the trade structure's fault, not the prediction's.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import selectinload
 
 from app.core.logging import get_logger
 from app.data.interfaces import OptionsProvider, PriceProvider
-from app.data.types import ProviderUnavailable
+from app.data.types import OHLCBar, ProviderUnavailable
 from app.eval.models import RealizedDirection, ThesisOutcome
 from app.eval.models import Thesis as ThesisRow
 from app.portfolio.models import (
@@ -46,6 +58,30 @@ _CONTRACT_MULTIPLIER = Decimal(100)
 # Stops random walk noise from being scored as a directional hit/miss.
 _FLAT_BAND_PCT = 0.5  # ±0.5% counts as flat
 
+_EASTERN = ZoneInfo("America/New_York")
+# US equity options stop trading at 4:00pm ET on expiration day.
+_EXPIRY_CUTOFF = time(16, 0)
+# If the expiration-day daily bar still isn't available this long after
+# expiry (provider outage), settle on the live quote rather than never.
+_SETTLEMENT_GRACE = timedelta(days=3)
+_SESSION_CLOSE = time(16, 0)
+# Outcome rows graded by the window method start their notes with this.
+WINDOW_METHOD = "method=window"
+
+
+def expiry_cutoff(expiration: date) -> datetime:
+    """The moment an option expiring on `expiration` stops trading (UTC)."""
+    return datetime.combine(expiration, _EXPIRY_CUTOFF, tzinfo=_EASTERN).astimezone(UTC)
+
+
+def _aware(ts: datetime) -> datetime:
+    """SQLite drops tzinfo on read; every timestamp in this codebase is UTC."""
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=UTC)
+
+
+def _eastern_date(ts: datetime) -> date:
+    return _aware(ts).astimezone(_EASTERN).date()
+
 
 @dataclass(frozen=True)
 class ResolveResult:
@@ -55,6 +91,38 @@ class ResolveResult:
     outcomes_written: int
     skipped: int
     errors: int
+
+
+@dataclass(frozen=True)
+class Grade:
+    """A thesis's realized outcome under the window method."""
+
+    realized_direction: str
+    hit: bool
+    pct_move: float
+    price_at_thesis: Decimal
+    price_at_eval: Decimal
+    eval_day: date
+    baseline_source: str  # "5min" | "daily"
+
+    def notes(self, window_days: int) -> str:
+        return (
+            f"{WINDOW_METHOD}; window={window_days}d; baseline={self.baseline_source}; "
+            f"eval_close={self.eval_day.isoformat()}"
+        )
+
+
+def window_end_day(thesis: ThesisRow) -> date:
+    """Last calendar day (ET) of the thesis's prediction window."""
+    return _eastern_date(thesis.generated_at) + timedelta(
+        days=max(1, int(thesis.prediction_window_days or 1))
+    )
+
+
+def window_closed(thesis: ThesisRow, now: datetime) -> bool:
+    """True once the window's last session has closed (4pm ET on the end day)."""
+    end = datetime.combine(window_end_day(thesis), _SESSION_CLOSE, tzinfo=_EASTERN)
+    return now >= end.astimezone(UTC)
 
 
 def _classify_direction(pct_move: float) -> str:
@@ -71,15 +139,23 @@ def _choose_close_reason(
     thesis: ThesisRow | None,
     today: date,
     underlying_now: Decimal,
+    now: datetime | None = None,
 ) -> CloseReason | None:
     """Decide if/why a trade should close. Returns None if it should stay open.
+
+    `today` is the US/Eastern calendar date. Expiration fires at 4:00pm ET on
+    the expiration date — not at UTC midnight, which is ~8pm ET the evening
+    *before*, when the option still has a full trading day left.
 
     Order of precedence: expiration first (it's binding), then stop-loss
     (capital preservation), then theta exit (avoid late decay). The thesis's
     exit fields live on the JSON suggested_contract blob; this reads them
     defensively in case they're missing.
     """
-    if today >= trade.expiration:
+    expired = (
+        now >= expiry_cutoff(trade.expiration) if now is not None else today > trade.expiration
+    )
+    if expired:
         return CloseReason.EXPIRED
 
     contract_payload = (thesis.suggested_contract if thesis is not None else None) or {}
@@ -108,7 +184,7 @@ def _choose_close_reason(
 
 
 class OutcomeResolver:
-    """Walks open shadow trades, closes them, and writes ThesisOutcome rows."""
+    """Closes shadow trades and grades theses (see module docstring)."""
 
     def __init__(
         self,
@@ -123,8 +199,19 @@ class OutcomeResolver:
 
     async def resolve_all(self, *, now: datetime | None = None) -> ResolveResult:
         now = now or datetime.now(UTC)
-        today = now.date()
+        closed, closed_skipped, closed_errors = await self._close_trades(now)
+        written, graded_skipped, graded_errors = await self._grade_theses(now)
+        return ResolveResult(
+            closed=closed,
+            outcomes_written=written,
+            skipped=closed_skipped + graded_skipped,
+            errors=closed_errors + graded_errors,
+        )
 
+    # === Job 1: close trades ===
+
+    async def _close_trades(self, now: datetime) -> tuple[int, int, int]:
+        today = _eastern_date(now)
         async with self._session_factory() as session:
             open_trades = list(
                 (
@@ -151,148 +238,245 @@ class OutcomeResolver:
                 account_kinds = {int(aid): kind for aid, kind in rows}
 
             closed_trades: list[ShadowTrade] = []
-            closed = outcomes = skipped = errors = 0
+            skipped = errors = 0
             for trade in open_trades:
                 try:
-                    did_close, outcome_written = await self._maybe_resolve_one(
-                        session, trade, now, today
-                    )
+                    if await self._maybe_close_trade(session, trade, now, today):
+                        closed_trades.append(trade)
                 except ProviderUnavailable as e:
                     skipped += 1
-                    _log.warning(
-                        "resolver_skipped",
-                        trade_id=trade.id,
-                        reason=e.reason.value,
-                    )
-                    continue
+                    _log.warning("resolver_skipped", trade_id=trade.id, reason=e.reason.value)
                 except Exception:
                     errors += 1
                     _log.exception("resolver_unexpected_error", trade_id=trade.id)
-                    continue
-                if did_close:
-                    closed += 1
-                    closed_trades.append(trade)
-                if outcome_written:
-                    outcomes += 1
 
-            if closed:
+            if closed_trades:
                 await session.commit()
                 _log.info(
-                    "resolver_tick_committed",
-                    closed=closed,
-                    outcomes=outcomes,
+                    "resolver_trades_closed",
+                    closed=len(closed_trades),
                     skipped=skipped,
                     errors=errors,
                 )
                 for trade in closed_trades:
                     _alert_trade_close(account_kinds.get(int(trade.account_id), "unknown"), trade)
+            return len(closed_trades), skipped, errors
 
-            return ResolveResult(
-                closed=closed, outcomes_written=outcomes, skipped=skipped, errors=errors
-            )
-
-    async def _maybe_resolve_one(
+    async def _maybe_close_trade(
         self,
         session: AsyncSession,
         trade: ShadowTrade,
         now: datetime,
         today: date,
-    ) -> tuple[bool, bool]:
-        """Decide if `trade` should close; if so, update the row and (at most
-        once per thesis) write the ThesisOutcome.
-
-        Returns (closed, outcome_written).
-        """
-        # Current underlying price (fail-fast on provider issues; the loop will
-        # skip + retry next tick).
-        underlying_now_q = await self._prices.get_latest_quote(trade.underlying)
+    ) -> bool:
+        """Close `trade` if an exit rule fires. Returns True if it closed."""
         # Zero-guarded (Quote.safe_price): a one-sided after-hours quote must
-        # NOT grade a thesis or trip an exit rule — it once read as a phantom
-        # -50% move. No usable price → defer to the next tick.
-        underlying_now = underlying_now_q.safe_price()
+        # NOT trip an exit rule — it once read as a phantom -50% move.
+        underlying_now = (await self._prices.get_latest_quote(trade.underlying)).safe_price()
         if underlying_now is None:
-            return False, False
+            return False
 
-        # Load the thesis row first — close-reason logic reads its
-        # exit_if_underlying_* + close_n_days_before_expiry fields.
+        # Close-reason logic reads the thesis's exit_if_underlying_* and
+        # close_n_days_before_expiry fields.
         thesis = await session.get(ThesisRow, trade.thesis_id)
         if thesis is None:
             _log.warning("resolver_thesis_missing", thesis_id=trade.thesis_id)
-            return False, False
+            return False
 
-        reason = _choose_close_reason(trade, thesis, today, underlying_now)
+        reason = _choose_close_reason(trade, thesis, today, underlying_now, now)
         if reason is None:
-            return False, False
+            return False
 
-        # Determine the option's close price. For EXPIRED, intrinsic value
-        # at expiration. For all other reasons, current mid (or last).
-        close_price = await self._close_price(trade, reason, underlying_now)
-        realized_pnl = (
-            (close_price - trade.premium_per_contract_usd)
-            * _CONTRACT_MULTIPLIER
-            * Decimal(trade.contracts)
-        )
+        # EXPIRED settles on the expiration day's official close, not whenever
+        # this tick happens to run. No settlement bar yet -> next tick.
+        underlying_eval = underlying_now
+        if reason == CloseReason.EXPIRED:
+            settlement = await self._settlement_price(trade, now, underlying_now)
+            if settlement is None:
+                return False
+            underlying_eval = settlement
 
-        # Look up underlying price at trade-open via daily OHLC.
-        underlying_at_open = await self._underlying_at_open(trade)
-        if underlying_at_open is None:
-            _log.warning(
-                "resolver_missing_open_price",
-                trade_id=trade.id,
-                underlying=trade.underlying,
-                opened_at=trade.opened_at.isoformat(),
-            )
-            return False, False
-
-        pct_move = float(
-            ((underlying_now - underlying_at_open) / underlying_at_open) * Decimal(100)
-        )
-        realized = _classify_direction(pct_move)
-        hit = (thesis.direction == realized) and realized != RealizedDirection.FLAT.value
-
-        # Update the trade row.
+        close_price = await self._close_price(trade, reason, underlying_eval)
         trade.status = ShadowTradeStatus.SHADOW_CLOSED.value
         trade.closed_at = now
         trade.close_reason = reason.value
         trade.close_price_per_contract_usd = close_price
-        trade.realized_pnl_usd = realized_pnl
-
-        # Write the outcome — at most ONE per thesis. thesis_outcomes.thesis_id
-        # is UNIQUE, but the engine opens one trade per ACCOUNT for the same
-        # thesis; a second insert would IntegrityError the tick's commit, roll
-        # back every close, and re-crash forever (the trades never leave
-        # shadow_open). The first closing trade grades the thesis; siblings
-        # just close. Autoflush makes this SELECT see a sibling's outcome
-        # added earlier in this same tick.
-        outcome_written = False
-        existing_outcome_id = await session.scalar(
-            select(ThesisOutcome.id).where(ThesisOutcome.thesis_id == trade.thesis_id)
+        trade.realized_pnl_usd = (
+            (close_price - trade.premium_per_contract_usd)
+            * _CONTRACT_MULTIPLIER
+            * Decimal(trade.contracts)
         )
-        if existing_outcome_id is None:
-            outcome = ThesisOutcome(
-                thesis_id=trade.thesis_id,
-                evaluated_at=now,
-                realized_direction=realized,
-                hit=hit,
-                underlying_price_at_thesis=underlying_at_open,
-                underlying_price_at_eval=underlying_now,
-                pct_move=pct_move,
-                notes=f"shadow_trade_id={trade.id}, close_reason={reason.value}",
-            )
-            session.add(outcome)
-            outcome_written = True
-
         _log.info(
             "resolver_closed_trade",
             trade_id=trade.id,
             thesis_id=trade.thesis_id,
             reason=reason.value,
-            pct_move=pct_move,
-            realized=realized,
-            hit=hit,
-            outcome_written=outcome_written,
+            realized_pnl=str(trade.realized_pnl_usd),
         )
-        return True, outcome_written
+        return True
+
+    # === Job 2: grade theses (the eval) ===
+
+    async def _grade_theses(self, now: datetime) -> tuple[int, int, int]:
+        """Write an outcome for every ungraded thesis whose window has closed."""
+        async with self._session_factory() as session:
+            candidates = [
+                t
+                for t in (
+                    await session.execute(
+                        select(ThesisRow)
+                        .options(selectinload(ThesisRow.outcome))
+                        .where(ThesisRow.pre_strictness.is_(False))
+                        .order_by(ThesisRow.generated_at)
+                    )
+                )
+                .scalars()
+                .all()
+                if t.outcome is None and window_closed(t, now)
+            ]
+            written = skipped = errors = 0
+            for thesis in candidates:
+                try:
+                    grade = await self.grade_thesis(thesis)
+                except Exception:
+                    errors += 1
+                    _log.exception("resolver_grade_failed", thesis_id=thesis.id)
+                    continue
+                if grade is None:
+                    skipped += 1
+                    continue
+                session.add(_outcome_row(thesis, grade, now))
+                written += 1
+                _log.info(
+                    "resolver_thesis_graded",
+                    thesis_id=thesis.id,
+                    symbol=thesis.symbol,
+                    direction=thesis.direction,
+                    realized=grade.realized_direction,
+                    hit=grade.hit,
+                    pct_move=round(grade.pct_move, 2),
+                )
+            if written:
+                await session.commit()
+            return written, skipped, errors
+
+    async def grade_thesis(self, thesis: ThesisRow) -> Grade | None:
+        """Grade one thesis under the window method; None if prices are missing."""
+        baseline = await self._price_at(thesis.symbol, thesis.generated_at)
+        if baseline is None:
+            _log.warning("resolver_missing_baseline", thesis_id=thesis.id, symbol=thesis.symbol)
+            return None
+        price_at_thesis, source = baseline
+        end_day = window_end_day(thesis)
+        closing = await self._close_on_or_before(thesis.symbol, end_day)
+        if closing is None or closing[1] < _eastern_date(thesis.generated_at):
+            _log.warning("resolver_missing_eval_close", thesis_id=thesis.id, end_day=str(end_day))
+            return None
+        price_at_eval, eval_day = closing
+        pct_move = float((price_at_eval - price_at_thesis) / price_at_thesis * Decimal(100))
+        realized = _classify_direction(pct_move)
+        return Grade(
+            realized_direction=realized,
+            hit=thesis.direction == realized and realized != RealizedDirection.FLAT.value,
+            pct_move=pct_move,
+            price_at_thesis=price_at_thesis,
+            price_at_eval=price_at_eval,
+            eval_day=eval_day,
+            baseline_source=source,
+        )
+
+    async def regrade_legacy_outcomes(self, *, now: datetime | None = None) -> dict[str, int]:
+        """One-time correction: re-grade outcomes written by the old
+        trade-close method under the window method, in place. The previous
+        values are preserved in `notes`. Idempotent (skips window rows)."""
+        now = now or datetime.now(UTC)
+        counts = {"regraded": 0, "flipped": 0, "skipped": 0}
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(ThesisOutcome, ThesisRow).join(
+                        ThesisRow, ThesisRow.id == ThesisOutcome.thesis_id
+                    )
+                )
+            ).all()
+            for outcome, thesis in rows:
+                if (outcome.notes or "").startswith(WINDOW_METHOD) or not window_closed(
+                    thesis, now
+                ):
+                    continue
+                grade = await self.grade_thesis(thesis)
+                if grade is None:
+                    counts["skipped"] += 1
+                    continue
+                was = (
+                    f"was: hit={outcome.hit} realized={outcome.realized_direction} "
+                    f"pct={outcome.pct_move:.2f} graded={outcome.evaluated_at:%Y-%m-%d} "
+                    f"({outcome.notes or ''})"
+                )
+                counts["flipped"] += int(outcome.hit != grade.hit)
+                outcome.realized_direction = grade.realized_direction
+                outcome.hit = grade.hit
+                outcome.pct_move = grade.pct_move
+                outcome.underlying_price_at_thesis = grade.price_at_thesis
+                outcome.underlying_price_at_eval = grade.price_at_eval
+                outcome.evaluated_at = now
+                outcome.notes = f"{grade.notes(thesis.prediction_window_days)}; regraded; {was}"
+                counts["regraded"] += 1
+            await session.commit()
+        _log.info("resolver_legacy_regrade", **counts)
+        return counts
+
+    # === Price helpers ===
+
+    async def _price_at(self, symbol: str, ts: datetime) -> tuple[Decimal, str] | None:
+        """The underlying's price at `ts`: the last 5-minute bar at or before it
+        (an off-hours thesis gets the last traded price), else the last daily
+        close whose session ended before `ts` — never a close from *after*
+        the thesis was written."""
+        ts = _aware(ts)
+        try:
+            intraday = await self._prices.get_ohlc(
+                symbol,
+                start=ts - timedelta(days=4),
+                end=ts + timedelta(minutes=5),
+                timeframe="5Min",
+            )
+        except ProviderUnavailable:
+            intraday = []
+        at_or_before = [b for b in intraday if b.timestamp <= ts]
+        if at_or_before:
+            return max(at_or_before, key=lambda b: b.timestamp).close, "5min"
+        try:
+            daily = await self._prices.get_ohlc(
+                symbol, start=ts - timedelta(days=7), end=ts + timedelta(days=1)
+            )
+        except ProviderUnavailable:
+            return None
+        settled = [
+            b
+            for b in daily
+            if datetime.combine(_eastern_date(b.timestamp), _SESSION_CLOSE, tzinfo=_EASTERN) <= ts
+        ]
+        if settled:
+            return max(settled, key=lambda b: b.timestamp).close, "daily"
+        return None
+
+    async def _close_on_or_before(self, symbol: str, day: date) -> tuple[Decimal, date] | None:
+        """Close of the last trading day on or before `day` (weekends/holidays
+        roll back to the prior session)."""
+        start = datetime.combine(day - timedelta(days=7), time.min, tzinfo=_EASTERN)
+        end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=_EASTERN)
+        try:
+            bars = await self._prices.get_ohlc(
+                symbol, start=start.astimezone(UTC), end=end.astimezone(UTC)
+            )
+        except ProviderUnavailable:
+            return None
+        eligible = [b for b in bars if _eastern_date(b.timestamp) <= day]
+        if not eligible:
+            return None
+        last = max(eligible, key=lambda b: b.timestamp)
+        return last.close, _eastern_date(last.timestamp)
 
     async def _close_price(
         self,
@@ -312,27 +496,57 @@ class OutcomeResolver:
         mid = _mid_price(contract)
         return mid if mid is not None else trade.premium_per_contract_usd
 
-    async def _underlying_at_open(self, trade: ShadowTrade) -> Decimal | None:
-        """Look up the underlying close on the day the trade opened (via OHLC)."""
-        open_day = trade.opened_at.date()
-        # Pull a small window so we get a bar even if open_day was a weekend.
+    async def _settlement_price(
+        self, trade: ShadowTrade, now: datetime, underlying_now: Decimal
+    ) -> Decimal | None:
+        """Underlying close on the expiration date (the settlement reference).
+
+        Returns None to defer while the daily bar isn't published yet; after
+        a grace period, falls back to the live price so a long provider
+        outage can't keep a position open forever."""
+        day_start = datetime.combine(trade.expiration, time.min, tzinfo=_EASTERN)
         try:
             bars = await self._prices.get_ohlc(
                 trade.underlying,
-                start=trade.opened_at - timedelta(days=5),
-                end=trade.opened_at + timedelta(days=1),
+                start=day_start.astimezone(UTC),
+                end=(day_start + timedelta(days=1)).astimezone(UTC),
             )
         except ProviderUnavailable:
-            return None
-        # Prefer the bar for the exact open day; otherwise the most recent
-        # bar at or before open_day.
-        exact = [b for b in bars if b.timestamp.date() == open_day]
-        if exact:
-            return exact[0].close
-        prior = [b for b in bars if b.timestamp.date() <= open_day]
-        if prior:
-            return max(prior, key=lambda b: b.timestamp).close
+            bars = []
+        close = _bar_close_on(bars, trade.expiration)
+        if close is not None:
+            return close
+        if now - expiry_cutoff(trade.expiration) > _SETTLEMENT_GRACE:
+            _log.warning(
+                "resolver_settlement_fallback_live_price",
+                trade_id=trade.id,
+                expiration=trade.expiration.isoformat(),
+            )
+            return underlying_now
         return None
+
+
+def _outcome_row(thesis: ThesisRow, grade: Grade, now: datetime) -> ThesisOutcome:
+    return ThesisOutcome(
+        thesis_id=thesis.id,
+        evaluated_at=now,
+        realized_direction=grade.realized_direction,
+        hit=grade.hit,
+        underlying_price_at_thesis=grade.price_at_thesis,
+        underlying_price_at_eval=grade.price_at_eval,
+        pct_move=grade.pct_move,
+        notes=grade.notes(thesis.prediction_window_days),
+    )
+
+
+def _bar_close_on(bars: list[OHLCBar], day: date) -> Decimal | None:
+    """Close of the daily bar for Eastern-calendar `day`, if present. (Daily
+    bars are stamped at 04:00 UTC = midnight ET; comparing UTC dates works
+    by accident, so compare in the market's own time zone.)"""
+    for b in bars:
+        if _eastern_date(b.timestamp) == day:
+            return b.close
+    return None
 
 
 def _alert_trade_close(account_kind: str, trade: ShadowTrade) -> None:

@@ -4,7 +4,10 @@ import {
   getAutonomousStatus,
   getCostSummary,
   getHealth,
+  getLLMHealth,
   type CostSummary,
+  type LLMHealth,
+  type LLMStepHealth,
   type WorkerStatus,
 } from '../lib/api';
 import { useModal } from './ModalContext';
@@ -13,8 +16,9 @@ type HealthState = 'loading' | 'ok' | 'error';
 
 /**
  * Top status bar. Sells the "always-on terminal" feel: market open/closed,
- * NYSE clock, autonomous state, model in use, notional LLM cost (click for
- * the per-model breakdown), backend health, and the keyboard hint.
+ * NYSE clock, autonomous state, model in use, LLM calls-vs-budget with a
+ * route-health dot (click for the failover chain + per-model usage), and
+ * backend health.
  */
 export function Header() {
   const modal = useModal();
@@ -23,6 +27,7 @@ export function Header() {
   const [version, setVersion] = useState<string | null>(null);
   const [worker, setWorker] = useState<WorkerStatus | null>(null);
   const [cost, setCost] = useState<CostSummary | null>(null);
+  const [llm, setLlm] = useState<LLMHealth | null>(null);
 
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
@@ -56,6 +61,11 @@ export function Header() {
         .catch(() => {
           /* non-fatal */
         });
+      getLLMHealth()
+        .then((h) => !cancelled && setLlm(h))
+        .catch(() => {
+          /* non-fatal */
+        });
     };
     refresh();
     const t = setInterval(refresh, 15000);
@@ -66,6 +76,7 @@ export function Header() {
   }, []);
 
   const marketState = computeMarketState(now);
+  const llmStatus = worstStatus(llm?.steps ?? []);
 
   return (
     <header className="bg-bg border-border flex shrink-0 items-center justify-between border-b px-4 py-2">
@@ -94,18 +105,27 @@ export function Header() {
         <Chip
           label="llm"
           value={cost ? `${cost.calls}/${cost.daily_request_budget}` : '—'}
-          tone={cost && cost.calls > cost.daily_request_budget * 0.8 ? 'error' : 'muted'}
+          tone={
+            llmStatus === 'down' || (cost && cost.calls > cost.daily_request_budget * 0.8)
+              ? 'error'
+              : llmStatus === 'degraded'
+                ? 'accent'
+                : llmStatus === 'ok'
+                  ? 'up'
+                  : 'muted'
+          }
+          dot={llm !== null}
           title={
             cost
-              ? `LLM calls this backend session vs the free-tier daily budget — click for the per-model breakdown`
+              ? `LLM calls today vs the free-tier daily budget · routes ${llmStatus} — click for the failover chain and per-model usage`
               : undefined
           }
           onClick={
             cost
               ? () =>
                   modal.open({
-                    title: 'LLM usage (session)',
-                    content: <CostBreakdownTable cost={cost} />,
+                    title: 'LLM routes & usage (today)',
+                    content: <LLMPanel cost={cost} health={llm} />,
                   })
               : undefined
           }
@@ -175,14 +195,92 @@ function dotBg(tone: 'up' | 'accent' | 'error' | 'muted'): string {
   return 'bg-text-dim';
 }
 
+function worstStatus(steps: LLMStepHealth[]): 'ok' | 'degraded' | 'down' | 'unknown' {
+  if (steps.length === 0) return 'unknown';
+  if (steps.some((s) => s.status === 'down' || s.status === 'unconfigured')) return 'down';
+  if (steps.some((s) => s.status === 'degraded')) return 'degraded';
+  return 'ok';
+}
+
+function formatClock(iso: string): string {
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(iso));
+}
+
+function LLMPanel({ cost, health }: { cost: CostSummary; health: LLMHealth | null }) {
+  return (
+    <div className="space-y-5">
+      {health && <RouteChains steps={health.steps} />}
+      <CostBreakdownTable cost={cost} />
+    </div>
+  );
+}
+
+function RouteChains({ steps }: { steps: LLMStepHealth[] }) {
+  return (
+    <div className="space-y-3 text-xs">
+      <p className="text-text-muted leading-relaxed">
+        Each step walks its routes in order. A route that hits a free-tier limit is parked until the
+        provider says it will recover (daily caps: until the quota resets) and the next route
+        serves; if every route is parked, events are recorded as <em>skipped</em> rather than
+        silently dropped.
+      </p>
+      {steps.map((step) => (
+        <div key={step.step}>
+          <div className="text-text-dim mb-1 text-[9px] tracking-wider uppercase">
+            {step.step} · <span className={statusClass(step.status)}>{step.status}</span>
+          </div>
+          {step.routes.length === 0 ? (
+            <div className="text-error text-[11px]">No usable route — check the API keys.</div>
+          ) : (
+            <ol className="space-y-1">
+              {step.routes.map((r) => (
+                <li
+                  key={`${r.provider}/${r.model}`}
+                  className="border-border flex items-center gap-2 rounded border px-2 py-1 text-[11px]"
+                >
+                  <span className="text-text-dim w-3 tabular-nums">{r.position + 1}</span>
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${r.state === 'ok' ? 'bg-up' : 'bg-error'}`}
+                  />
+                  <span className="text-text font-mono">
+                    {r.provider}:{r.model}
+                  </span>
+                  <span className="text-text-muted ml-auto tabular-nums">
+                    {r.state === 'cooling' && r.cooldown_until
+                      ? `parked until ${formatClock(r.cooldown_until)} ET`
+                      : `${r.successes} ok · ${r.rate_limited} 429 since restart`}
+                  </span>
+                </li>
+              ))}
+            </ol>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function statusClass(status: string): string {
+  if (status === 'ok') return 'text-up';
+  if (status === 'degraded') return 'text-accent';
+  return 'text-error';
+}
+
 function CostBreakdownTable({ cost }: { cost: CostSummary }) {
   return (
     <div className="space-y-3 text-xs">
       <p className="text-text-muted leading-relaxed">
         Every key here is free-tier, so the scarce resource is <em>requests per day</em> (budget:{' '}
         {cost.daily_request_budget}, config-driven), not dollars. The cost column is notional — what
-        these calls <em>would</em> bill at list price. Counters are per backend session and reset on
-        restart.
+        these calls <em>would</em> bill at list price.{' '}
+        {cost.source === 'db'
+          ? 'Counted from the llm_calls log since midnight Pacific (when Gemini’s free quota resets), so restarts don’t reset it.'
+          : 'The usage log is unreachable, so these are in-process counters since the last restart.'}
       </p>
       <table className="w-full text-[11px] tabular-nums">
         <thead>

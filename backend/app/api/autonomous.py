@@ -5,6 +5,7 @@ Toggles + observability for the always-on discovery pipeline.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
@@ -27,6 +28,10 @@ router = APIRouter(prefix="/autonomous", tags=["autonomous"])
 
 class WorkerStatusResponse(BaseModel):
     state: str
+    # Topology (CLAUDE.md §4): event bus + whether ingestion is a separate service.
+    event_bus: str = "memory"
+    ingestion_mode: str = "embedded"
+    ingestion_state: str = "stopped"
     started_at: datetime | None
     stopped_at: datetime | None
     watchlist: list[str]
@@ -39,6 +44,10 @@ class WorkerStatusResponse(BaseModel):
     events_published: int
     events_consumed: int
     events_passed_triage: int
+    # Visible skips: stale backlog, LLM quota exhausted, daily thesis cap.
+    events_stale: int = 0
+    events_skipped_quota: int = 0
+    events_skipped_thesis_cap: int = 0
     theses_produced: int
     triage_failures: int
     thesis_failures: int
@@ -58,6 +67,8 @@ class WorkerStatusResponse(BaseModel):
     last_resolver_at: datetime | None = None
     # Alpaca news WS (Step 4).
     news_stream_connected: bool = False
+    news_stream_state: str = "disabled"
+    news_stream_last_error: str | None = None
     news_stream_connects: int = 0
     news_stream_messages: int = 0
     news_stream_events_published: int = 0
@@ -73,49 +84,11 @@ class WorkerStatusResponse(BaseModel):
 
 
 def _to_response(s: WorkerStatus) -> WorkerStatusResponse:
-    return WorkerStatusResponse(
-        state=s.state.value if isinstance(s.state, WorkerState) else str(s.state),
-        started_at=s.started_at,
-        stopped_at=s.stopped_at,
-        watchlist=s.watchlist,
-        poll_interval_seconds=s.poll_interval_seconds,
-        triage_provider=s.triage_provider,
-        triage_model=s.triage_model,
-        thesis_provider=s.thesis_provider,
-        thesis_model=s.thesis_model,
-        polls_completed=s.polls_completed,
-        events_published=s.events_published,
-        events_consumed=s.events_consumed,
-        events_passed_triage=s.events_passed_triage,
-        theses_produced=s.theses_produced,
-        triage_failures=s.triage_failures,
-        thesis_failures=s.thesis_failures,
-        persistence_failures=s.persistence_failures,
-        queue_depth=s.queue_depth,
-        last_event_at=s.last_event_at,
-        last_thesis_at=s.last_thesis_at,
-        last_poll_at=s.last_poll_at,
-        last_error=s.last_error,
-        recent_triage_decisions=s.recent_triage_decisions,
-        mtm_ticks_completed=s.mtm_ticks_completed,
-        mtm_marks_written=s.mtm_marks_written,
-        resolver_ticks_completed=s.resolver_ticks_completed,
-        resolver_outcomes_written=s.resolver_outcomes_written,
-        last_mtm_at=s.last_mtm_at,
-        last_resolver_at=s.last_resolver_at,
-        news_stream_connected=s.news_stream_connected,
-        news_stream_connects=s.news_stream_connects,
-        news_stream_messages=s.news_stream_messages,
-        news_stream_events_published=s.news_stream_events_published,
-        news_stream_duplicates_dropped=s.news_stream_duplicates_dropped,
-        last_news_message_at=s.last_news_message_at,
-        catalyst_fetcher_runs=s.catalyst_fetcher_runs,
-        catalyst_events_upserted=s.catalyst_events_upserted,
-        catalyst_scheduler_runs=s.catalyst_scheduler_runs,
-        catalyst_theses_triggered=s.catalyst_theses_triggered,
-        last_catalyst_fetch_at=s.last_catalyst_fetch_at,
-        last_catalyst_trigger_at=s.last_catalyst_trigger_at,
-    )
+    # One mapping instead of a field-by-field copy: a field added to
+    # WorkerStatus can't silently go missing from the API.
+    fields = asdict(s)
+    fields["state"] = s.state.value if isinstance(s.state, WorkerState) else str(s.state)
+    return WorkerStatusResponse(**fields)
 
 
 @router.post("/start", response_model=WorkerStatusResponse)
@@ -208,9 +181,10 @@ class InjectEventResponse(BaseModel):
 @router.post("/inject", response_model=InjectEventResponse)
 async def inject_event(req: InjectEventRequest) -> InjectEventResponse:
     """Push a synthetic event onto the discovery bus. Worker must be
-    running. Useful for the demo (fire an earnings beat → watch reactive
-    thesis flow through the funnel in real time) and for seeding the eval
-    harness during development."""
+    running. Useful for the demo (fire an earnings beat → watch the reactive
+    thesis stream through the funnel in real time). It is a dry run: the
+    thesis is generated but never persisted, traded or scored — synthetic
+    news must never become eval data."""
     from uuid import uuid4
 
     from app.discovery.types import DiscoveryEvent

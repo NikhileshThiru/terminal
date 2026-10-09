@@ -1,16 +1,20 @@
-"""AutonomousWorker — singleton that owns the always-on discovery + reactive pipeline.
+"""AutonomousWorker — singleton that owns the always-on agent pipeline.
 
 Wraps:
-- the in-memory event bus
-- the EDGAR poller (Phase 6 starts with EDGAR only; Alpaca news WebSocket
-  is the next-up source)
-- the reactive runner (triage → copilot → persist)
+- the event bus consumer side (in-memory queue, or a Redis Streams consumer
+  group in the docker-compose stack — see app/discovery/bus.py)
+- ingestion (EDGAR poller + Alpaca news WS), either embedded in this process
+  or running as the separate `ingestion` service (INGESTION_MODE=external),
+  in which case its health comes from a Redis heartbeat
+- the reactive runner (staleness gate → triage → copilot → persist)
+- reconciliation (mark-to-market, outcome resolver) and the catalyst calendar
 
-Default state: STOPPED. User explicitly toggles on via the UI / API.
+Autostarts with the API (`autonomous_autostart`); can be toggled via the UI.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,20 +25,17 @@ from typing import Any
 from app.agent.build import build_copilot
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.data.edgar import EdgarFilingsProvider
 from app.data.finnhub import FinnhubProvider
-from app.data.registry import get_edgar, get_finnhub
+from app.data.registry import get_finnhub
 from app.data.types import ProviderUnavailable, ProviderUnavailableReason
-from app.discovery.alpaca_news_stream import AlpacaNewsStream
-from app.discovery.bus import EventBus, InMemoryEventBus
+from app.discovery.bus import EventBus, build_event_bus
 from app.discovery.catalyst_fetcher import CalendarFetcher
 from app.discovery.catalyst_jobs import CatalystJobs
 from app.discovery.catalyst_scheduler import CatalystScheduler
-from app.discovery.edgar_poller import EdgarPoller
+from app.discovery.ingest import IngestionService, read_status
 from app.discovery.reactive import ReactiveRunner
 from app.discovery.types import DiscoveryEvent
-from app.llm.gemini import GeminiProvider
-from app.llm.groq import GroqProvider
+from app.llm.factory import get_router
 from app.llm.interface import LLMProvider
 from app.portfolio.jobs import ReconciliationJobs
 from app.portfolio.mtm import get_mtm_service
@@ -53,6 +54,11 @@ class WorkerState(StrEnum):
 @dataclass
 class WorkerStatus:
     state: WorkerState
+    # Topology: which bus, and whether ingestion is in-process or its own service.
+    event_bus: str
+    ingestion_mode: str
+    # embedded: always "embedded". external: "up" while heartbeats arrive, else "down".
+    ingestion_state: str
     started_at: datetime | None
     stopped_at: datetime | None
     watchlist: list[str]
@@ -65,6 +71,9 @@ class WorkerStatus:
     events_published: int
     events_consumed: int
     events_passed_triage: int
+    events_stale: int
+    events_skipped_quota: int
+    events_skipped_thesis_cap: int
     theses_produced: int
     triage_failures: int
     thesis_failures: int
@@ -84,6 +93,9 @@ class WorkerStatus:
     last_resolver_at: datetime | None
     # Alpaca news WS (Step 4 universe ingestion).
     news_stream_connected: bool
+    # connected | reconnecting | auth_failed | stopped | dead | disabled
+    news_stream_state: str
+    news_stream_last_error: str | None
     news_stream_connects: int
     news_stream_messages: int
     news_stream_events_published: int
@@ -98,19 +110,6 @@ class WorkerStatus:
     last_catalyst_trigger_at: datetime | None
 
 
-def _build_triage_llm(provider: str) -> LLMProvider:
-    if provider == "gemini":
-        return GeminiProvider()
-    if provider == "groq":
-        return GroqProvider()
-    raise ProviderUnavailable(
-        reason=ProviderUnavailableReason.NOT_IMPLEMENTED,
-        message=f"Triage provider {provider!r} not supported (use 'gemini' or 'groq').",
-        provider=provider,
-        retryable=False,
-    )
-
-
 class AutonomousWorker:
     """Holds + controls the discovery pipeline. Singleton; access via `get_worker()`."""
 
@@ -119,10 +118,12 @@ class AutonomousWorker:
         self._started_at: datetime | None = None
         self._stopped_at: datetime | None = None
         self._bus: EventBus | None = None
-        self._poller: EdgarPoller | None = None
-        self._news_stream: AlpacaNewsStream | None = None
+        # Embedded ingestion (INGESTION_MODE=embedded) ...
+        self._ingestion: IngestionService | None = None
+        # ... or the external service's last Redis heartbeat (external mode).
+        self._ingest_snapshot: dict[str, Any] | None = None
+        self._ingest_monitor: asyncio.Task[None] | None = None
         self._runner: ReactiveRunner | None = None
-        self._edgar: EdgarFilingsProvider | None = None
         self._triage_llm: LLMProvider | None = None
         self._finnhub: FinnhubProvider | None = None
         # Reconciliation jobs (Phase 7+, DESIGN.md §8).
@@ -144,38 +145,11 @@ class AutonomousWorker:
         settings = get_settings()
         self._state = WorkerState.STARTING
         try:
-            self._bus = InMemoryEventBus(maxsize=1000)
-            self._edgar = get_edgar()
-            self._triage_llm = _build_triage_llm(settings.llm_triage_provider)
+            self._bus = build_event_bus()
+            self._triage_llm = get_router("triage")
             copilot = build_copilot()
             from app.eval.persistence import get_session_factory
 
-            self._poller = EdgarPoller(
-                filings=self._edgar,
-                bus=self._bus,
-                poll_interval_seconds=settings.discovery_poll_interval_seconds,
-                # High-volume forms (Form 4 insider trades) are filtered to
-                # the watchlist so the triage budget isn't eaten by routine
-                # insider filings from no-name issuers.
-                watchlist=settings.watchlist,
-                session_factory=get_session_factory(),
-            )
-            # Universe-wide news. Skipped silently if Alpaca creds aren't set —
-            # the poller alone is enough to keep the pipeline alive.
-            try:
-                self._news_stream = AlpacaNewsStream(
-                    bus=self._bus,
-                    session_factory=get_session_factory(),
-                )
-            except ProviderUnavailable as e:
-                if e.reason == ProviderUnavailableReason.AUTH_MISSING:
-                    _log.warning(
-                        "alpaca_news_stream_disabled",
-                        reason="ALPACA_API_KEY/SECRET not set",
-                    )
-                    self._news_stream = None
-                else:
-                    raise
             self._runner = ReactiveRunner(
                 bus=self._bus,
                 copilot=copilot,
@@ -185,10 +159,15 @@ class AutonomousWorker:
                 # Persist every triage decision to the DB so the News pane
                 # survives backend restarts and so we can re-query by symbol.
                 session_factory=get_session_factory(),
+                enforce_market_hours=settings.market_hours_gate,
+                max_theses_per_day=settings.autonomous_max_reactive_theses_per_day,
+                max_event_age_seconds=settings.reactive_max_event_age_seconds,
             )
-            await self._poller.start()
-            if self._news_stream is not None:
-                await self._news_stream.start()
+            if settings.ingestion_mode == "embedded":
+                self._ingestion = IngestionService(self._bus)
+                await self._ingestion.start()
+            else:
+                self._ingest_monitor = asyncio.create_task(self._watch_ingestion())
             await self._runner.start()
 
             # Reconciliation jobs — owned here so they share lifecycle with
@@ -218,6 +197,7 @@ class AutonomousWorker:
                         session_factory=get_session_factory(),
                         lead_days=settings.catalyst_lead_days,
                         risk_budget_usd=settings.autonomous_risk_budget_usd,
+                        enforce_market_hours=settings.market_hours_gate,
                     ),
                     fetcher_interval_seconds=settings.catalyst_fetcher_interval_seconds,
                     scheduler_interval_seconds=settings.catalyst_scheduler_interval_seconds,
@@ -239,6 +219,8 @@ class AutonomousWorker:
             self._state = WorkerState.RUNNING
             _log.info(
                 "autonomous_worker_started",
+                event_bus=settings.event_bus,
+                ingestion_mode=settings.ingestion_mode,
                 watchlist=settings.watchlist,
                 triage_provider=settings.llm_triage_provider,
                 thesis_provider=settings.llm_thesis_provider,
@@ -289,50 +271,81 @@ class AutonomousWorker:
                 await self._runner.stop()
             except Exception as e:  # pragma: no cover
                 _log.exception("worker_runner_teardown_failed", error=str(e))
-        if self._news_stream is not None:
+        if self._ingestion is not None:
             try:
-                await self._news_stream.stop()
+                await self._ingestion.stop()
             except Exception as e:  # pragma: no cover
-                _log.exception("worker_news_stream_teardown_failed", error=str(e))
-        if self._poller is not None:
-            try:
-                await self._poller.stop()
-            except Exception as e:  # pragma: no cover
-                _log.exception("worker_poller_teardown_failed", error=str(e))
-        if self._edgar is not None:
-            with contextlib.suppress(Exception):  # pragma: no cover
-                await self._edgar.aclose()
-        self._poller = None
-        self._news_stream = None
+                _log.exception("worker_ingestion_teardown_failed", error=str(e))
+        if self._ingest_monitor is not None:
+            self._ingest_monitor.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._ingest_monitor
+        # NB: providers come from the shared registry (app/data/registry.py);
+        # closing them here would break the copilot's research tools.
+        self._ingestion = None
+        self._ingest_monitor = None
+        self._ingest_snapshot = None
         self._runner = None
-        self._edgar = None
         self._bus = None
         self._triage_llm = None
         self._finnhub = None
         self._reconciliation = None
         self._catalyst = None
 
+    async def _watch_ingestion(self) -> None:
+        """External mode: mirror the ingestion service's Redis heartbeat."""
+        from redis.asyncio import Redis
+
+        redis = Redis.from_url(get_settings().redis_url, decode_responses=True)
+        try:
+            while True:
+                try:
+                    self._ingest_snapshot = await read_status(redis)
+                except Exception as e:
+                    self._ingest_snapshot = None
+                    _log.warning("ingestion_status_read_failed", error=str(e)[:200])
+                await asyncio.sleep(5.0)
+        finally:
+            with contextlib.suppress(Exception):
+                await redis.aclose()
+
+    def _ingest_view(self) -> tuple[str, dict[str, Any]]:
+        """(ingestion_state, snapshot) — the same shape in both modes."""
+        if self._ingestion is not None:
+            return "embedded", self._ingestion.snapshot()
+        if get_settings().ingestion_mode == "external" and self.is_running:
+            snap = self._ingest_snapshot
+            return ("up", snap) if snap is not None else ("down", {})
+        return "stopped", {}
+
     def status(self) -> WorkerStatus:
         settings = get_settings()
         runner_stats = self._runner.stats if self._runner is not None else None
+        ingestion_state, ing = self._ingest_view()
         return WorkerStatus(
             state=self._state,
+            event_bus=settings.event_bus,
+            ingestion_mode=settings.ingestion_mode,
+            ingestion_state=ingestion_state,
             started_at=self._started_at,
             stopped_at=self._stopped_at,
             watchlist=list(settings.watchlist),
             poll_interval_seconds=(
-                self._poller.poll_interval
-                if self._poller
-                else settings.discovery_poll_interval_seconds
+                ing.get("poll_interval_seconds") or settings.discovery_poll_interval_seconds
             ),
             triage_provider=settings.llm_triage_provider,
             triage_model=settings.llm_triage_model,
             thesis_provider=settings.llm_thesis_provider,
             thesis_model=settings.llm_thesis_model,
-            polls_completed=self._poller.polls_completed if self._poller else 0,
-            events_published=self._poller.events_published if self._poller else 0,
+            polls_completed=int(ing.get("polls_completed") or 0),
+            events_published=int(ing.get("events_published") or 0),
             events_consumed=runner_stats.events_consumed if runner_stats else 0,
             events_passed_triage=runner_stats.events_passed_triage if runner_stats else 0,
+            events_stale=runner_stats.events_stale if runner_stats else 0,
+            events_skipped_quota=runner_stats.events_skipped_quota if runner_stats else 0,
+            events_skipped_thesis_cap=(
+                runner_stats.events_skipped_thesis_cap if runner_stats else 0
+            ),
             theses_produced=runner_stats.theses_produced if runner_stats else 0,
             triage_failures=runner_stats.triage_failures if runner_stats else 0,
             thesis_failures=runner_stats.thesis_failures if runner_stats else 0,
@@ -340,9 +353,9 @@ class AutonomousWorker:
             queue_depth=self._bus.qsize() if self._bus else 0,
             last_event_at=runner_stats.last_event_at if runner_stats else None,
             last_thesis_at=runner_stats.last_thesis_at if runner_stats else None,
-            last_poll_at=self._poller.last_poll_at if self._poller else None,
+            last_poll_at=_parse_ts(ing.get("last_poll_at")),
             last_error=(runner_stats.last_error if runner_stats else None)
-            or (self._poller.last_error if self._poller else None),
+            or ing.get("poller_last_error"),
             recent_triage_decisions=(
                 list(runner_stats.last_triage_decisions) if runner_stats else []
             ),
@@ -362,16 +375,14 @@ class AutonomousWorker:
             last_resolver_at=(
                 self._reconciliation.last_resolver_at if self._reconciliation else None
             ),
-            news_stream_connected=(self._news_stream.connected if self._news_stream else False),
-            news_stream_connects=(self._news_stream.connects if self._news_stream else 0),
-            news_stream_messages=(self._news_stream.messages_received if self._news_stream else 0),
-            news_stream_events_published=(
-                self._news_stream.events_published if self._news_stream else 0
-            ),
-            news_stream_duplicates_dropped=(
-                self._news_stream.duplicates_dropped if self._news_stream else 0
-            ),
-            last_news_message_at=(self._news_stream.last_message_at if self._news_stream else None),
+            news_stream_connected=bool(ing.get("news_connected")),
+            news_stream_state=str(ing.get("news_state") or "disabled"),
+            news_stream_last_error=ing.get("news_last_error"),
+            news_stream_connects=int(ing.get("news_connects") or 0),
+            news_stream_messages=int(ing.get("news_messages") or 0),
+            news_stream_events_published=int(ing.get("news_events_published") or 0),
+            news_stream_duplicates_dropped=int(ing.get("news_duplicates_dropped") or 0),
+            last_news_message_at=_parse_ts(ing.get("last_news_message_at")),
             catalyst_fetcher_runs=(self._catalyst.fetcher_runs_completed if self._catalyst else 0),
             catalyst_events_upserted=(
                 self._catalyst.events_upserted_total if self._catalyst else 0
@@ -383,6 +394,15 @@ class AutonomousWorker:
             last_catalyst_fetch_at=(self._catalyst.last_fetcher_at if self._catalyst else None),
             last_catalyst_trigger_at=(self._catalyst.last_trigger_at if self._catalyst else None),
         )
+
+
+def _parse_ts(value: Any) -> datetime | None:
+    if value is None or isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 @lru_cache(maxsize=1)

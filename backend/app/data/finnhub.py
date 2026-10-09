@@ -152,8 +152,12 @@ class FinnhubProvider(BaseProvider):
             )
 
     async def _get(self, path: str, params: dict[str, Any]) -> Any:
-        full = {**params, "token": self._api_key}
-        resp = await self._client.get(f"{_BASE}{path}", params=full)
+        # Token goes in Finnhub's documented header, never the query string:
+        # URLs end up in access logs, httpx INFO logs and exception messages
+        # (the July 2026 container logs printed the key on every call).
+        resp = await self._client.get(
+            f"{_BASE}{path}", params=params, headers={"X-Finnhub-Token": self._api_key}
+        )
         self._raise_for_http(resp, path)
         return resp.json()
 

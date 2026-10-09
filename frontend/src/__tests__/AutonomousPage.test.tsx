@@ -7,6 +7,14 @@ import { AutonomousPage } from '../pages/AutonomousPage';
 
 const STOPPED_STATUS = {
   state: 'stopped',
+  event_bus: 'redis',
+  ingestion_mode: 'external',
+  ingestion_state: 'stopped',
+  news_stream_state: 'stopped',
+  news_stream_last_error: null,
+  events_stale: 0,
+  events_skipped_quota: 0,
+  events_skipped_thesis_cap: 0,
   started_at: null,
   stopped_at: null,
   watchlist: ['AAPL', 'MSFT', 'NVDA'],
@@ -76,7 +84,8 @@ describe('AutonomousPage', () => {
     ]);
     renderPage();
     expect(screen.getByRole('heading', { name: /autonomous worker/i })).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByText('stopped')).toBeInTheDocument());
+    // Worker, ingestion and news feed all report "stopped" while stopped.
+    await waitFor(() => expect(screen.getAllByText('stopped')).toHaveLength(3));
     expect(screen.getByRole('button', { name: /click to start/i })).toBeInTheDocument();
   });
 
@@ -190,5 +199,29 @@ describe('AutonomousPage', () => {
     expect(aapl?.textContent).toMatch(/★/);
     expect(tsla?.textContent).not.toMatch(/★/);
     expect(aapl!.compareDocumentPosition(tsla!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('surfaces a dead news feed and quota skips instead of looking healthy', async () => {
+    globalThis.fetch = mockFetch([
+      [
+        'GET',
+        '/autonomous/status',
+        () => ({
+          ...RUNNING_STATUS,
+          ingestion_state: 'up',
+          news_stream_state: 'auth_failed',
+          news_stream_last_error: 'auth: Alpaca news auth failed',
+          events_stale: 2,
+          events_skipped_quota: 5,
+          triage_model: 'openai/gpt-oss-20b',
+        }),
+      ],
+      ['GET', '/autonomous/theses', () => []],
+      ['GET', '/autonomous/catalysts', () => []],
+    ]);
+    renderPage();
+    await waitFor(() => expect(screen.getByText('auth_failed')).toBeInTheDocument());
+    expect(screen.getByText('7')).toBeInTheDocument(); // 2 stale + 5 quota skips
+    expect(screen.getByText('gpt-oss-20b / gemini-2.5-flash')).toBeInTheDocument();
   });
 });

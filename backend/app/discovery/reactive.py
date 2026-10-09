@@ -17,6 +17,8 @@ from datetime import UTC, datetime
 from app.agent.copilot import Copilot, CopilotError, CopilotRun
 from app.core.correlation import set_correlation_id
 from app.core.logging import get_logger
+from app.core.market_hours import eastern_day_start, is_market_open
+from app.data.types import ProviderUnavailable, ProviderUnavailableReason
 from app.discovery.bus import EventBus
 from app.discovery.triage import TriageDecision, triage
 from app.discovery.types import DiscoveryEvent
@@ -37,7 +39,12 @@ _log = get_logger(__name__)
 @dataclass
 class ReactiveStats:
     events_consumed: int = 0
+    events_off_session: int = 0
     events_passed_triage: int = 0
+    events_skipped_quota: int = 0
+    events_stale: int = 0
+    synthetic_dry_runs: int = 0
+    events_skipped_thesis_cap: int = 0
     theses_produced: int = 0
     triage_failures: int = 0
     thesis_failures: int = 0
@@ -84,12 +91,24 @@ class ReactiveRunner:
         triage_model: str,
         risk_budget_usd: float | None = 500.0,
         session_factory: object | None = None,
+        enforce_market_hours: bool = False,
+        max_theses_per_day: int | None = None,
+        max_event_age_seconds: float | None = None,
     ) -> None:
         self._bus = bus
         self._copilot = copilot
         self._triage_llm = triage_llm
         self._triage_model = triage_model
         self._risk_budget = risk_budget_usd
+        # Prod wiring (worker.py) passes settings.market_hours_gate; the
+        # default stays off so tests and ad-hoc runs aren't wall-clock-dependent.
+        self._enforce_market_hours = enforce_market_hours
+        # Thesis pacing (config: autonomous_max_reactive_theses_per_day).
+        # None = unbounded (tests / ad-hoc runs).
+        self._max_theses_per_day = max_theses_per_day
+        self._theses_by_day: dict[datetime, int] = {}  # ET-day start -> count
+        # Staleness gate (config: reactive_max_event_age_seconds). None = off.
+        self._max_event_age = max_event_age_seconds
         # Optional DB sink so triage decisions survive a backend restart.
         # If absent, decisions live only in the in-memory buffer (legacy /
         # tests).
@@ -135,7 +154,15 @@ class ReactiveRunner:
                 _log.exception("reactive_consume_failed", error=str(e))
                 continue
 
-            await self._process_one(event)
+            try:
+                await self._process_one(event)
+            finally:
+                # ACK only after processing: with the Redis bus, an event the
+                # worker died on stays pending and is re-delivered on restart.
+                try:
+                    await self._bus.ack(event)
+                except Exception as e:
+                    _log.warning("reactive_ack_failed", event_id=event.id, error=str(e)[:200])
 
     async def _process_one(self, event: DiscoveryEvent) -> CopilotRun | None:
         self.stats.events_consumed += 1
@@ -143,29 +170,116 @@ class ReactiveRunner:
         # Each event gets its own correlation id for end-to-end tracing.
         set_correlation_id(event.id.replace("-", "")[:16] or None)
 
+        # === Market-hours gate (CLAUDE.md §7) ===
+        # Off-session events are dropped BEFORE triage: a thesis generated at
+        # 3am Sunday would be graded against stale quotes (eval pollution) and
+        # the drop also spares overnight LLM quota. The decision is recorded
+        # so the News pane shows why the event produced nothing.
+        if self._enforce_market_hours and not is_market_open(datetime.now(UTC)):
+            self.stats.events_off_session += 1
+            self._record_recent_decision(
+                event,
+                TriageDecision(
+                    passed=False,
+                    reason="off-session: US equity market closed (market-hours gate)",
+                    confidence=1.0,
+                ),
+            )
+            _log.info(
+                "reactive_event_off_session",
+                event_id=event.id,
+                symbol=(event.symbols[0] if event.symbols else None),
+                headline=event.headline[:120],
+            )
+            return None
+
+        # === Staleness gate ===
+        # A backlog (worker restarted after ingestion kept publishing) is not
+        # worth triaging: the reactive path's value is minutes-fresh news.
+        if self._max_event_age is not None and event.ingested_at is not None:
+            age = (datetime.now(UTC) - event.ingested_at).total_seconds()
+            if age > self._max_event_age:
+                self.stats.events_stale += 1
+                self._record_recent_decision(
+                    event,
+                    TriageDecision(
+                        passed=False,
+                        reason=f"skipped: stale — waited {age / 60:.0f} min on the bus",
+                        confidence=1.0,
+                    ),
+                )
+                return None
+
         # === Triage ===
         try:
             decision = await triage(event, llm=self._triage_llm, model=self._triage_model)
+        except ProviderUnavailable as e:
+            self.stats.triage_failures += 1
+            self.stats.last_error = f"triage: {e.reason.value}: {e}"
+            if e.reason == ProviderUnavailableReason.RATE_LIMITED:
+                # Every triage route is out of quota. Record a visible skip so
+                # the News pane says *why* this event produced nothing, rather
+                # than the event silently vanishing (the July 2026 failure).
+                self.stats.events_skipped_quota += 1
+                self._record_recent_decision(
+                    event,
+                    TriageDecision(
+                        passed=False,
+                        reason="skipped: all triage LLM routes rate-limited (free-tier quota)",
+                        confidence=0.0,
+                    ),
+                )
+            _log.warning("reactive_triage_failed", event_id=event.id, error=str(e))
+            return None
         except Exception as e:
             self.stats.triage_failures += 1
             self.stats.last_error = f"triage: {type(e).__name__}: {e}"
             _log.warning("reactive_triage_failed", event_id=event.id, error=str(e))
             return None
 
-        self._record_recent_decision(event, decision)
-
         if not decision.passed:
+            self._record_recent_decision(event, decision)
             return None
 
         self.stats.events_passed_triage += 1
 
+        # === Thesis pacing ===
+        if self._max_theses_per_day is not None:
+            produced_today = await self._reactive_theses_today()
+            if produced_today >= self._max_theses_per_day:
+                self.stats.events_skipped_thesis_cap += 1
+                self._record_recent_decision(
+                    event,
+                    decision.model_copy(
+                        update={
+                            "reason": (
+                                f"passed triage, skipped: daily reactive thesis cap "
+                                f"({self._max_theses_per_day}) reached — {decision.reason}"
+                            )[:300]
+                        }
+                    ),
+                )
+                _log.info(
+                    "reactive_thesis_cap_reached",
+                    event_id=event.id,
+                    cap=self._max_theses_per_day,
+                )
+                return None
+
+        self._record_recent_decision(event, decision)
+
         # === Thesis ===
+        # Synthetic events (POST /autonomous/inject) run the full funnel so the
+        # reasoning stream can be demoed, but are a DRY RUN: never persisted,
+        # traded, or counted in the eval — fake news must not become data.
+        synthetic = bool(event.payload.get("synthetic"))
         prompt = _format_event_for_copilot(event, decision.reason)
         try:
             run = await self._copilot.generate(
                 prompt,
                 risk_budget_usd=self._risk_budget,
                 source_bucket="reactive",
+                record_attempt=not synthetic,
             )
         except CopilotError as e:
             self.stats.thesis_failures += 1
@@ -177,6 +291,16 @@ class ReactiveRunner:
             self.stats.last_error = f"copilot unexpected: {type(e).__name__}: {e}"
             _log.exception("reactive_thesis_unexpected", event_id=event.id)
             return None
+
+        if synthetic:
+            self.stats.synthetic_dry_runs += 1
+            _log.info(
+                "reactive_synthetic_dry_run",
+                event_id=event.id,
+                symbol=run.thesis.symbol,
+                direction=run.thesis.direction,
+            )
+            return run
 
         # === Persist ===
         thesis_id: int | None = None
@@ -203,6 +327,8 @@ class ReactiveRunner:
 
         self.stats.theses_produced += 1
         self.stats.last_thesis_at = datetime.now(UTC)
+        day = eastern_day_start(self.stats.last_thesis_at)
+        self._theses_by_day = {day: self._theses_by_day.get(day, 0) + 1}
         _log.info(
             "reactive_thesis_produced",
             event_id=event.id,
@@ -212,6 +338,26 @@ class ReactiveRunner:
             grounded=run.thesis.grounding_check_passed,
         )
         return run
+
+    async def _reactive_theses_today(self) -> int:
+        """Reactive theses generated since midnight ET. DB-backed when wired so
+        the cap survives restarts; otherwise this process's counter."""
+        since = eastern_day_start(datetime.now(UTC))
+        if self._session_factory is not None:
+            try:
+                from sqlalchemy import func, select
+
+                from app.eval.models import Thesis as ThesisRow
+
+                async with self._session_factory() as session:  # type: ignore[operator]
+                    stmt = select(func.count(ThesisRow.id)).where(
+                        ThesisRow.source_bucket == "reactive",
+                        ThesisRow.generated_at >= since,
+                    )
+                    return int((await session.execute(stmt)).scalar_one())
+            except Exception as e:
+                _log.warning("reactive_thesis_count_failed", error=str(e)[:200])
+        return self._theses_by_day.get(since, 0)
 
     def _record_recent_decision(self, event: DiscoveryEvent, decision: TriageDecision) -> None:
         now = datetime.now(UTC)
@@ -235,6 +381,10 @@ class ReactiveRunner:
                 -self.MAX_RECENT_DECISIONS :
             ]
         # Persist for the News pane (survives restart, queryable by symbol).
+        # Synthetic events stay in-memory only: the decisions table is the
+        # replay log, and fake headlines don't belong in it.
+        if event.payload.get("synthetic"):
+            return
         # Async fire-and-forget; failures must not abort the funnel. We hold
         # a reference in self._persist_tasks so the task isn't GC'd mid-flight
         # (RUF006).

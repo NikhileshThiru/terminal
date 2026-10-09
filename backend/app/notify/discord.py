@@ -169,6 +169,9 @@ async def send(payload: dict[str, Any]) -> bool:
         return False
 
 
+_pending: set[asyncio.Task[Any]] = set()
+
+
 def fire_and_forget(payload: dict[str, Any]) -> None:
     """Schedule delivery on the running loop without awaiting it."""
     if not enabled():
@@ -179,6 +182,10 @@ def fire_and_forget(payload: dict[str, Any]) -> None:
         # No running loop (sync context / interpreter teardown) — drop quietly.
         return
     task = loop.create_task(send(payload))
+    # asyncio holds only a weak reference to tasks: without a strong one an
+    # alert can be garbage-collected mid-send. Hold it until done.
+    _pending.add(task)
+    task.add_done_callback(_pending.discard)
     # Retrieve the (impossible) exception so asyncio never logs
     # "Task exception was never retrieved".
     task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)

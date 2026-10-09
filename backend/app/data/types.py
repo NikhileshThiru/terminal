@@ -162,6 +162,9 @@ class ProviderUnavailableReason(StrEnum):
     NOT_IMPLEMENTED = "not_implemented"
     DATA_MISSING = "data_missing"
     TIMEOUT = "timeout"
+    # The configured model no longer exists upstream (e.g. Groq retired
+    # llama-3.3-70b-versatile in 2026). Not retryable on the same model.
+    MODEL_NOT_FOUND = "model_not_found"
 
 
 class ProviderUnavailable(Exception):
@@ -178,12 +181,17 @@ class ProviderUnavailable(Exception):
         message: str,
         provider: str | None = None,
         retryable: bool = True,
+        retry_after_seconds: float | None = None,
     ) -> None:
         super().__init__(message)
         self.reason = reason
         self.message = message
         self.provider = provider
         self.retryable = retryable
+        # Upstream's own "come back in N seconds" hint (429 Retry-After,
+        # Gemini retryDelay, Groq "try again in 7m12s"). The LLM router uses
+        # it to size the cooldown instead of guessing.
+        self.retry_after_seconds = retry_after_seconds
 
     def __repr__(self) -> str:
         return (

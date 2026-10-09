@@ -33,7 +33,7 @@ export function ThesisDisplay({ thesis, currentUnderlying = null }: Props) {
           <div className="text-text-dim text-[9px] tracking-wider uppercase">Trade</div>
           <code className="text-accent text-sm font-semibold">{c.occ_symbol}</code>
           <div className="text-text-muted text-[11px] tabular-nums">
-            ${c.estimated_premium_per_contract} × {c.contracts} ={' '}
+            ${c.estimated_premium_per_contract} × 100 sh × {c.contracts} ={' '}
             <span className="text-down">${c.max_risk_usd} at risk</span>
           </div>
         </div>

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from app.agent.copilot import AttemptRecord
 from app.agent.schemas import Thesis as ThesisDTO
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -84,11 +85,11 @@ async def write_thesis(thesis: ThesisDTO) -> int:
             funnel_latency_ms=row.funnel_latency_ms,
             correlation_id=row.correlation_id,
         )
-        _alert_thesis(row)
+        alert_thesis(row)
         return int(row.id)
 
 
-def _alert_thesis(row: ThesisRow) -> None:
+def alert_thesis(row: ThesisRow) -> None:
     """Fire-and-forget Discord alert for a persisted thesis (Step 9.1)."""
     # Local import keeps the eval module free of an httpx dep at import time.
     from app.notify import discord
@@ -108,3 +109,25 @@ def _alert_thesis(row: ThesisRow) -> None:
             max_risk_usd=contract.get("max_risk_usd"),
         )
     )
+
+
+async def record_attempt(record: AttemptRecord) -> None:
+    """Copilot attempt sink: one `thesis_attempts` row per attempt."""
+    from datetime import UTC, datetime
+
+    from app.eval.models import ThesisAttempt
+
+    async with get_session_factory()() as session:
+        session.add(
+            ThesisAttempt(
+                attempted_at=datetime.now(UTC),
+                source_bucket=record.source_bucket,
+                outcome=record.outcome,
+                correlation_id=record.correlation_id,
+                latency_ms=record.latency_ms,
+                llm_provider=record.llm_provider,
+                llm_model=record.llm_model,
+                detail=record.detail,
+            )
+        )
+        await session.commit()

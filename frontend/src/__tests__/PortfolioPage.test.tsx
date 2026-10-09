@@ -105,9 +105,12 @@ describe('PortfolioPage', () => {
   });
 
   it('renders an open position with its live mark', async () => {
+    // Open and closed are separate server-filtered requests, so an old open
+    // position can't be pushed out of the window by newer closed trades.
     globalThis.fetch = _mockFetch([
       ['/portfolio/accounts', () => ACCOUNTS],
-      ['/portfolio/shadow-trades', () => TRADES],
+      ['status=open', () => TRADES],
+      ['status=closed', () => []],
     ]);
     render(<PortfolioPage />);
     await waitFor(() => expect(screen.getByText('AAPL301220C00150000')).toBeInTheDocument());
